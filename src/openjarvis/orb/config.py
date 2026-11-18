@@ -89,7 +89,9 @@ class HandsConfig:
     workspace: str = "~/Jarvis"  # where delegated work happens
     model: str = ""  # Claude Code model alias; empty = Claude Code default
     confirm: bool = False  # True = ask out loud before starting a task
-    max_budget_usd: float = 2.0  # per task, when supported by the CLI
+    # Per-task cap in API-equivalent USD. With a Claude subscription nothing
+    # is billed: it only limits how much of the usage quota one task can use.
+    max_budget_usd: float = 2.0
     max_parallel: int = 2
     services_model: str = ""  # model for ask_services; empty = sonnet
     services_budget_usd: float = 0.5
@@ -171,9 +173,12 @@ enabled = true
 workspace = "~/Jarvis"    # dossier où il construit
 model = ""                # vide = modèle par défaut de Claude Code
 confirm = false           # true = demande ton accord avant de lancer une tâche
-max_budget_usd = 2.0      # plafond de coût par tâche
+# plafond par tâche (en équivalent API) ; avec un abonnement Claude, rien
+# n'est facturé : ça évite juste qu'une tâche épuise ton quota d'utilisation
+max_budget_usd = 2.0
 max_parallel = 2
-# modèle pour agenda/mails/Drive/Notion : vide = sonnet, "haiku" = 20x moins cher
+# modèle pour agenda/mails/Drive/Notion : vide = sonnet, "haiku" = plus léger
+# pour ton quota d'abonnement
 services_model = ""
 services_budget_usd = 0.5
 extra_domains = []        # domaines réseau en plus, ex. ["api.monservice.com"]
