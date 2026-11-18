@@ -95,3 +95,17 @@ class Brain:
     ) -> str: ...  # short spoken line on startup, aware of time / last session
     def shutdown(self) -> None: ...  # write end-of-session note to the journal
 ```
+
+## v2 additions
+
+- `toolkit.py`: `Tool` (schema + callable, `confirm=True` = ask out loud
+  first), `ToolBox`, `Notifier` (background work speaks up on its own).
+- `actions.py`: `Reflexes(cfg, notifier).tools()/.close()` — instant local
+  actions (apps, URLs, web search, weather, timers/reminders, music, volume,
+  notes, clipboard).
+- `hands.py`: `Hands(cfg, notifier).tools()/.close()` — long tasks delegated
+  to the Claude Code CLI in a sandboxed per-task folder under `hands.workspace`.
+- `Brain(cfg, toolbox)`: Ollama tool calling, confirmation flow,
+  `record_spoken(text)` for announcements.
+- `Ears.listen_for_interrupt(stop, threshold)`: barge-in while speaking.
+- `voice_fx.py`: voice post-processing presets (`voice.effect`).

@@ -13,10 +13,19 @@ Persistent state lives in ``config.DATA_DIR``:
 - ``journal.jsonl``: one event per line (session_start, exchange, session_end)
 - ``facts.json``: short things the user asked to remember
 - ``self.json``: birth date, session counter, last conversation time
+
+Tool calling: when a ``ToolBox`` is given, its schemas are sent with every
+request (they render into the system prefix, so the cache stays valid). The
+model either streams text (yielded at once) or ``tool_calls``; calls run in
+parallel, their results are appended as ``tool`` messages and the follow-up
+reply is streamed, for up to ``MAX_TOOL_ROUNDS`` rounds. Tools marked
+``confirm=True`` are not run: the brain asks out loud and runs them only after
+a spoken yes on the next turn (rule-based, no model call).
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -25,6 +34,10 @@ import re
 import subprocess
 import threading
 import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
@@ -34,6 +47,7 @@ import httpx
 
 from openjarvis.orb import config as orb_config
 from openjarvis.orb.config import JarvisConfig
+from openjarvis.orb.toolkit import Tool, ToolBox
 
 log = logging.getLogger("openjarvis.orb.brain")
 
@@ -43,6 +57,35 @@ MAX_FACT_CHARS = 160
 NUM_CTX = 8192
 NUM_PREDICT = 400
 GREETING_BUDGET_S = 1.9
+MAX_TOOL_ROUNDS = 4
+PROGRESS_AFTER_S = 0.6  # speak the tool's progress line if it runs longer
+TOOL_TIMEOUT_S = 120.0
+PENDING_TTL_S = 60.0
+ACTION_NUDGE = (
+    "Tu n'as appelé aucun outil : rien ne s'est passé. Si un outil correspond à "
+    "la demande, appelle-le maintenant, sans texte. Sinon, réponds normalement."
+)
+_ACTION_RE = re.compile(
+    r"\b(?:ouvre|lance|d[ée]marre|ferme|quitte|mets?|joue|monte|baisse|coupe"
+    r"|r[èe]gle|minuteur|chrono|timer|rappelle[- ]moi|rappel|programme|note|prends"
+    r"|[ée]cris|copie|cherche|recherche|regarde|v[ée]rifie|m[ée]t[ée]o|temps qu'il"
+    r"|pleut|pleuvoir|temp[ée]rature|musique|chanson|morceau|pause|suivant"
+    r"|pr[ée]c[ée]dent|volume|batterie|annule|liste|qui a gagn[ée]|actualit[ée]"
+    r"|derni[èe]res? nouvelles|construis|cr[ée]e|code|installe|connecte|automatise)",
+    re.I,
+)
+
+
+def _wants_action(text: str) -> bool:
+    return bool(_ACTION_RE.search(text))
+
+
+TOOL_RULE = (
+    "Règle absolue pour les outils : si la demande correspond à un outil, ta "
+    "réponse est UNIQUEMENT l'appel de l'outil, sans aucun texte avant. Tu ne "
+    "parles qu'après avoir reçu le résultat. Dire « je vérifie », « j'ouvre » ou "
+    "« c'est fait » sans appeler l'outil est une faute grave : rien ne se passe."
+)
 
 ERR_UNREACHABLE = "Je n'arrive pas à joindre mon moteur de réflexion."
 ERR_NO_MODEL = "Mon modèle de langage n'est pas installé sur cette machine."
@@ -242,6 +285,202 @@ class _ThinkFilter:
     def flush(self) -> str:
         rest, self.buf = ("" if self.inside else self.buf), ""
         return rest
+
+
+# ------------------------------------------------------- yes / no detection
+
+
+def _fold(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text.lower().replace("’", "'"))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = re.sub(r"[^\w' -]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+_YES = (
+    "oui",
+    "ouais",
+    "ouep",
+    "yes",
+    "yep",
+    "ok",
+    "okay",
+    "d'accord",
+    "dac",
+    "vas-y",
+    "vas y",
+    "allez",
+    "allez-y",
+    "allez y",
+    "go",
+    "confirme",
+    "je confirme",
+    "confirmé",
+    "c'est bon",
+    "c'est parti",
+    "parfait",
+    "exactement",
+    "bien sur",
+    "carrement",
+    "absolument",
+    "tout a fait",
+    "fais-le",
+    "fais le",
+    "fais-la",
+    "lance",
+    "lance-le",
+    "lance le",
+    "envoie",
+    "volontiers",
+    "avec plaisir",
+    "affirmatif",
+    "evidemment",
+    "certainement",
+    "bien entendu",
+    "oui oui",
+)
+_NO = (
+    "non",
+    "nan",
+    "no",
+    "annule",
+    "annuler",
+    "laisse tomber",
+    "laisse",
+    "stop",
+    "pas maintenant",
+    "surtout pas",
+    "oublie",
+    "oublie ca",
+    "n'en fais rien",
+    "ne fais rien",
+    "ne le fais pas",
+    "attends",
+    "plus tard",
+    "negatif",
+    "pas question",
+    "certainement pas",
+    "non merci",
+    "pas du tout",
+)
+_FILLER = {
+    "euh",
+    "heu",
+    "bah",
+    "ben",
+    "bon",
+    "alors",
+    "eh",
+    "hum",
+    "jarvis",
+    "merci",
+    "stp",
+    "svp",
+    "s'il",
+    "te",
+    "vous",
+    "plait",
+    "plaît",
+    "oui",
+    "non",
+    "vas-y",
+    "go",
+    "c'est",
+    "bon",
+    "ok",
+    "d'accord",
+    "allez",
+    "volontiers",
+    "parfait",
+    "fais-le",
+    "pas",
+    "ca",
+    "ça",
+    "maintenant",
+    "tout",
+    "a",
+    "fait",
+    "laisse",
+    "tomber",
+    "annule",
+}
+
+
+def _match_lead(text: str, phrases: tuple[str, ...]) -> str | None:
+    """Longest phrase the text starts with (on a word boundary)."""
+    best = None
+    for p in phrases:
+        p = _fold(p)
+        if (text == p or text.startswith(p + " ")) and (
+            best is None or len(p) > len(best)
+        ):
+            best = p
+    return best
+
+
+def classify_confirmation(text: str) -> str | None:
+    """'yes' / 'no' for a short spoken (French) answer, else None.
+
+    Only short answers count: "oui mais plutôt demain" is a new request."""
+    t = _fold(text)
+    words = t.split()
+    while words and words[0] in ("euh", "heu", "bah", "ben", "alors", "hum", "jarvis"):
+        words.pop(0)
+    t = " ".join(words)
+    if not t:
+        return None
+    for verdict, phrases in (("no", _NO), ("yes", _YES)):
+        lead = _match_lead(t, phrases)
+        if lead is None:
+            continue
+        rest = t[len(lead) :].split()
+        allowed = _FILLER | {w for p in phrases for w in _fold(p).split()}
+        if all(w in allowed for w in rest):
+            return verdict
+        return None
+    return None
+
+
+@dataclass
+class _Pending:
+    calls: list[dict[str, Any]]
+    expires: float  # time.monotonic() deadline
+
+
+def _call_name(call: dict[str, Any]) -> str:
+    return str(call.get("function", {}).get("name", ""))
+
+
+def _call_args(call: dict[str, Any]) -> dict[str, Any]:
+    args = call.get("function", {}).get("arguments") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            args = {}
+    return args if isinstance(args, dict) else {}
+
+
+def _describe_call(call: dict[str, Any]) -> str:
+    """Fallback spoken description of a pending action."""
+    name, args = _call_name(call), _call_args(call)
+    detail = next((str(v) for v in args.values() if isinstance(v, str) and v), "")
+    if name == "quit_app":
+        return f"Je ferme {detail or 'cette application'}"
+    if detail:
+        return f"Je lance « {detail[:120]} »"
+    return f"Je lance l'action {name}"
+
+
+def _run_tool(tool: Tool, args: dict[str, Any]) -> str:
+    """Run a tool, dropping arguments its function does not accept."""
+    try:
+        params = inspect.signature(tool.func).parameters
+        if not any(p.kind is p.VAR_KEYWORD for p in params.values()):
+            args = {k: v for k, v in args.items() if k in params}
+    except (TypeError, ValueError):
+        pass
+    return tool.run(**args)
 
 
 # --------------------------------------------------------------- self-state
@@ -444,23 +683,36 @@ class Brain:
     frozen system prompt, then turns whose user message carries a one-line
     live state stamp, then the raw assistant output. The system prompt is
     only rebuilt when the history is trimmed (the cache breaks anyway).
+    A turn is the list of messages it produced (user, assistant tool calls,
+    tool results, final assistant text), stored verbatim.
     """
 
-    def __init__(self, cfg: JarvisConfig):
+    def __init__(
+        self,
+        cfg: JarvisConfig,
+        toolbox: ToolBox | None = None,
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ):
         self.cfg = cfg
         self.bcfg = cfg.brain
+        self.toolbox = toolbox
         data_dir = Path(orb_config.DATA_DIR)
         data_dir.mkdir(parents=True, exist_ok=True)
         self._client = httpx.Client(
             base_url=self.bcfg.host.rstrip("/"),
             timeout=httpx.Timeout(60.0, connect=3.0),
+            transport=transport,
         )
+        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="orb-tool")
+        self._pending: _Pending | None = None
         self._machine = _MachineProbe()
         self._facts = _Facts(data_dir / "facts.json")
         self._journal = _Journal(data_dir / "journal.jsonl")
         self._self_path = data_dir / "self.json"
-        # (user message as sent to the model, raw assistant output)
-        self._history: list[tuple[str, str]] = []
+        # one entry per turn: the messages exactly as sent to / produced by
+        # the model (append-only, so Ollama's prefix cache stays valid)
+        self._history: list[list[dict[str, Any]]] = []
         self._session_exchanges: list[tuple[str, str]] = []
         self._lock = threading.Lock()
         self._greeting_msg: str | None = None
@@ -520,6 +772,10 @@ class Brain:
             parts.append(facts)
         if self._digest:
             parts.append(self._digest)
+        if self.toolbox:
+            # Last in the prompt on purpose: small models (qwen3.5 9b, no
+            # thinking) otherwise often *say* "j'ouvre…" without calling.
+            parts.append(TOOL_RULE)
         return "\n\n".join(parts)
 
     def _identity_block(self) -> str:
@@ -539,7 +795,8 @@ class Brain:
             f"- Dernière conversation avant cette session : {last}.\n"
             f"- Tu tournes sur le modèle de langage {self.bcfg.model}, servi par "
             f"Ollama, en local sur un Mac ({self._machine.chip}, macOS). "
-            "Aucune donnée ne quitte la machine.\n"
+            "Ta réflexion reste locale ; seuls tes outils web (recherche, météo) "
+            "passent par Internet.\n"
             "- Chaque message de l'utilisateur se termine par une ligne [État …] "
             "ajoutée automatiquement (heure, durée de session, charge machine) : "
             "c'est ta perception du moment présent ; l'utilisateur ne l'a pas "
@@ -583,16 +840,25 @@ class Brain:
             )
         return "\n".join(lines)
 
-    def _messages(self, user_msg: str) -> list[dict[str, str]]:
-        msgs = [{"role": "system", "content": self._static_prompt}]
-        for u, a in self._history:
-            msgs.append({"role": "user", "content": u})
-            msgs.append({"role": "assistant", "content": a})
-        msgs.append({"role": "user", "content": user_msg})
+    def _messages(self, user_msg: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
+        msgs: list[dict[str, Any]] = [
+            {"role": "system", "content": self._static_prompt}
+        ]
+        for turn in self._history:
+            msgs.extend(turn)
+        if isinstance(user_msg, str):
+            msgs.append({"role": "user", "content": user_msg})
+        else:
+            msgs.extend(user_msg)
         return msgs
 
     def _payload(
-        self, messages: list[dict[str, str]], stream: bool, **options: Any
+        self,
+        messages: list[dict[str, Any]],
+        stream: bool,
+        *,
+        tools: bool = True,
+        **options: Any,
     ) -> dict[str, Any]:
         opts = {
             "temperature": self.bcfg.temperature,
@@ -600,7 +866,7 @@ class Brain:
             "num_predict": NUM_PREDICT,
         }
         opts.update(options)
-        return {
+        payload: dict[str, Any] = {
             "model": self.bcfg.model,
             "messages": messages,
             "stream": stream,
@@ -608,6 +874,10 @@ class Brain:
             "keep_alive": self.bcfg.keep_alive,
             "options": opts,
         }
+        # Same tool list on every request: it renders into the cached prefix.
+        if tools and self.toolbox:
+            payload["tools"] = self.toolbox.schemas()
+        return payload
 
     def _greeting_prompt(self) -> str:
         if self.first_ever:
@@ -667,106 +937,380 @@ class Brain:
             log.warning("Fact extraction failed", exc_info=True)
 
         user_msg = f"{user_text}\n\n{self._state_stamp()}"
-        payload = self._payload(self._messages(user_msg), True)
+        pending, self._pending = self._pending, None
+        if pending is not None and time.monotonic() > pending.expires:
+            log.info("Pending action expired")
+            pending = None
+        if pending is not None:
+            verdict = classify_confirmation(user_text)
+            log.info("Pending action, answer classified as %s", verdict)
+            if verdict == "yes":
+                yield from self._run_turn(
+                    user_text, user_msg, stop, forced_calls=pending.calls
+                )
+                return
+            if verdict == "no":
+                ack = "D'accord, j'annule."
+                turn = [
+                    {"role": "user", "content": user_msg},
+                    {"role": "assistant", "content": ack},
+                ]
+                self._record(user_text, turn, ack)
+                yield ack
+                return
+        yield from self._run_turn(user_text, user_msg, stop)
+
+    # ------------------------------------------------------------ the loop
+
+    def _stream_round(
+        self,
+        messages: list[dict[str, Any]],
+        stop: threading.Event,
+        tools: bool,
+        out: dict[str, Any],
+    ) -> Iterator[str]:
+        """Stream one model response. Yields spoken deltas; fills ``out`` with
+        raw content, tool_calls, error, removed (echoed stamp dropped)."""
+        payload = self._payload(messages, True, tools=tools)
         raw: list[str] = []
-        spoken: list[str] = []
+        calls: list[dict[str, Any]] = []
         think = _ThinkFilter()
         brackets = _BracketFilter()
-        error: str | None = None
+        spoken = False
         t0 = time.monotonic()
-        first = None
+        out.update(raw="", tool_calls=calls, error=None, removed=False, first=None)
         try:
             with self._client.stream("POST", "/api/chat", json=payload) as resp:
                 if resp.status_code == 404:
                     resp.read()
                     log.error("Ollama model missing: %s", resp.text[:200])
-                    error = ERR_NO_MODEL
-                elif resp.status_code >= 400:
+                    out["error"] = ERR_NO_MODEL
+                    return
+                if resp.status_code >= 400:
                     resp.read()
                     log.error("Ollama error %s: %s", resp.status_code, resp.text[:200])
-                    error = ERR_GENERIC
-                else:
-                    leading = True
-                    for line in resp.iter_lines():
-                        if stop.is_set():
-                            break
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                        except ValueError:
-                            continue
-                        if chunk.get("error"):
-                            log.error("Ollama stream error: %s", chunk["error"])
-                            error = ERR_GENERIC
-                            break
-                        # message.thinking (if any) is deliberately ignored
-                        content = chunk.get("message", {}).get("content", "")
-                        raw.append(content)
-                        delta = _clean_spoken(brackets.feed(think.feed(content)))
-                        if leading:
-                            delta = delta.lstrip()
-                            leading = not delta
-                        if delta:
-                            if first is None:
-                                first = time.monotonic() - t0
-                            spoken.append(delta)
-                            yield delta
-                        if chunk.get("done"):
-                            break
-                    tail = _clean_spoken(
-                        brackets.feed(think.flush()) + brackets.flush()
-                    )
-                    if tail and not stop.is_set():
-                        spoken.append(tail)
-                        yield tail
+                    out["error"] = ERR_GENERIC
+                    return
+                leading = True
+                for line in resp.iter_lines():
+                    if stop.is_set():
+                        break
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except ValueError:
+                        continue
+                    if chunk.get("error"):
+                        log.error("Ollama stream error: %s", chunk["error"])
+                        out["error"] = ERR_GENERIC
+                        break
+                    msg = chunk.get("message") or {}
+                    calls.extend(msg.get("tool_calls") or [])
+                    # message.thinking (if any) is deliberately ignored
+                    content = msg.get("content", "")
+                    raw.append(content)
+                    delta = _clean_spoken(brackets.feed(think.feed(content)))
+                    if leading:
+                        delta = delta.lstrip()
+                        leading = not delta
+                    if delta:
+                        if out["first"] is None:
+                            out["first"] = time.monotonic() - t0
+                        spoken = True
+                        yield delta
+                    if chunk.get("done"):
+                        log.debug(
+                            "Ollama: prompt %s tok in %.2fs, gen %s tok in %.2fs",
+                            chunk.get("prompt_eval_count"),
+                            chunk.get("prompt_eval_duration", 0) / 1e9,
+                            chunk.get("eval_count"),
+                            chunk.get("eval_duration", 0) / 1e9,
+                        )
+                        break
+                tail = _clean_spoken(brackets.feed(think.flush()) + brackets.flush())
+                if tail and not stop.is_set():
+                    spoken = True
+                    yield tail
         except httpx.ConnectError:
-            error = ERR_UNREACHABLE
+            out["error"] = ERR_UNREACHABLE
         except httpx.HTTPError as exc:
             log.error("Ollama request failed: %s", exc)
             if not spoken:
-                error = ERR_UNREACHABLE
+                out["error"] = ERR_UNREACHABLE
+        out["raw"] = "".join(raw)
+        out["removed"] = brackets.removed
+
+    def _execute(
+        self, calls: list[dict[str, Any]], stop: threading.Event, quiet: bool
+    ) -> Iterator[str]:
+        """Run tool calls in parallel; yields at most one progress line.
+        Returns the ``tool`` messages (via StopIteration value)."""
+        jobs = []
+        for call in calls:
+            name, args = _call_name(call), _call_args(call)
+            tool = self.toolbox.get(name) if self.toolbox else None
+            t0 = time.monotonic()
+            if tool is None:
+                fut = None
+            else:
+                fut = self._pool.submit(_run_tool, tool, args)
+            jobs.append((call, name, args, tool, fut, t0))
+        futures = [j[4] for j in jobs if j[4] is not None]
+        if futures:
+            _done, running = wait_futures(futures, timeout=PROGRESS_AFTER_S)
+            if running and not quiet:
+                progress = next(
+                    (j[3].progress for j in jobs if j[4] in running and j[3].progress),
+                    "",
+                )
+                if progress:
+                    yield progress
+            deadline = time.monotonic() + TOOL_TIMEOUT_S
+            while running and not stop.is_set() and time.monotonic() < deadline:
+                _done, running = wait_futures(running, timeout=0.2)
+        results: list[dict[str, Any]] = []
+        for call, name, args, tool, fut, t0 in jobs:
+            if tool is None:
+                content = f"Outil inconnu : {name}."
+            elif fut is not None and fut.done():
+                content = fut.result()
+            else:
+                content = (
+                    "Interrompu avant la fin." if stop.is_set() else "Délai dépassé."
+                )
+            log.info(
+                "Tool %s(%s) -> %.2fs: %s",
+                name,
+                json.dumps(args, ensure_ascii=False)[:200],
+                time.monotonic() - t0,
+                content[:160].replace("\n", " "),
+            )
+            msg: dict[str, Any] = {
+                "role": "tool",
+                "content": content,
+                "tool_name": name,
+            }
+            if call.get("id"):
+                msg["tool_call_id"] = call["id"]
+            results.append(msg)
+        return results
+
+    def _run_turn(
+        self,
+        user_text: str,
+        user_msg: str,
+        stop: threading.Event,
+        forced_calls: list[dict[str, Any]] | None = None,
+    ) -> Iterator[str]:
+        turn: list[dict[str, Any]] = [{"role": "user", "content": user_msg}]
+        spoken: list[str] = []
+        t0 = time.monotonic()
+        first: float | None = None
+        removed = False
+        error: str | None = None
+        ask_confirmation: list[dict[str, Any]] = []
+        gave_up = False
+
+        def emit(delta: str, new_segment: bool = True) -> str:
+            nonlocal first
+            if first is None:
+                first = time.monotonic() - t0
+            # keep sentences apart across rounds ("Je regarde." + "Demain…")
+            if (
+                new_segment
+                and spoken
+                and not spoken[-1][-1:].isspace()
+                and not delta[:1].isspace()
+            ):
+                delta = " " + delta
+            spoken.append(delta)
+            return delta
+
+        if forced_calls:  # the user just said yes to a pending action
+            turn.append(
+                {"role": "assistant", "content": "", "tool_calls": forced_calls}
+            )
+            results = yield from self._emit_all(
+                self._execute(forced_calls, stop, quiet=False), emit
+            )
+            turn.extend(results)
+
+        for rnd in range(MAX_TOOL_ROUNDS):
+            if stop.is_set():
+                break
+            # Last round (or right after deferring an action): text only. The
+            # tools stay in the payload anyway: dropping them would change the
+            # cached prefix and force a full re-evaluation of the prompt.
+            can_act = rnd < MAX_TOOL_ROUNDS - 1 and not ask_confirmation
+            out: dict[str, Any] = {}
+            round_text: list[str] = []
+            # Clear action request ("ouvre…", "mets un minuteur…"): hold the
+            # first round's text; if the model only *talks* about acting
+            # instead of calling a tool, nudge it once (see ACTION_NUDGE).
+            hold = rnd == 0 and not forced_calls and _wants_action(user_text)
+            held: list[str] = []
+            for delta in self._stream_round(self._messages(turn), stop, True, out):
+                if hold:
+                    held.append(delta)
+                    continue
+                yield emit(delta, new_segment=not round_text)
+                round_text.append(delta)
+            if hold and not out.get("error") and not out["tool_calls"]:
+                log.info("Action request answered without a tool: nudging once")
+                retry: dict[str, Any] = {}
+                nudge = {"role": "system", "content": ACTION_NUDGE}
+                list(
+                    self._stream_round(
+                        self._messages([*turn, nudge]), stop, True, retry
+                    )
+                )
+                if retry.get("tool_calls") and not retry.get("error"):
+                    out = retry
+                    held = []
+            for delta in held:
+                yield emit(delta, new_segment=not round_text)
+                round_text.append(delta)
+            removed = removed or out.get("removed", False)
+            if out.get("error"):
+                error = out["error"]
+                break
+            calls = out["tool_calls"]
+            if calls and not can_act:
+                log.info("Ignoring %d tool call(s) in a text-only round", len(calls))
+                calls = []
+                gave_up = not round_text and not ask_confirmation
+            msg: dict[str, Any] = {"role": "assistant", "content": out["raw"]}
+            if calls:
+                msg["tool_calls"] = calls
+            turn.append(msg)
+            if not calls or stop.is_set():
+                break
+            run_now, deferred = [], []
+            for call in calls:
+                tool = self.toolbox.get(_call_name(call)) if self.toolbox else None
+                (deferred if tool is not None and tool.confirm else run_now).append(
+                    call
+                )
+            results: list[dict[str, Any]] = []
+            if run_now:
+                results = yield from self._emit_all(
+                    self._execute(run_now, stop, quiet=bool(round_text)), emit
+                )
+            for call in deferred:
+                log.info(
+                    "Tool %s(%s) needs confirmation",
+                    _call_name(call),
+                    json.dumps(_call_args(call), ensure_ascii=False)[:200],
+                )
+                waiting: dict[str, Any] = {
+                    "role": "tool",
+                    "tool_name": _call_name(call),
+                    "content": "NON EXÉCUTÉ : en attente d'un oui de l'utilisateur. "
+                    "Demande-lui en une phrase courte s'il confirme, en nommant "
+                    "précisément l'action.",
+                }
+                if call.get("id"):
+                    waiting["tool_call_id"] = call["id"]
+                results.append(waiting)
+            turn.extend(results)
+            if deferred:
+                ask_confirmation = deferred
+
+        if ask_confirmation and not stop.is_set():
+            self._pending = _Pending(
+                calls=ask_confirmation, expires=time.monotonic() + PENDING_TTL_S
+            )
+            text = "".join(spoken)
+            if "?" not in text:  # the model forgot to ask: use a template
+                question = f"{_describe_call(ask_confirmation[0])}, je confirme ?"
+                turn.append({"role": "assistant", "content": question})
+                yield emit(question)
+
+        if gave_up and not stop.is_set():
+            sorry = "Désolé, je n'ai pas réussi à aller au bout."
+            turn[-1] = {"role": "assistant", "content": sorry}
+            yield emit(sorry)
         if error and not spoken:
             yield error
             return
         reply = "".join(spoken).strip()
         log.info(
-            "Reply: first token %.2fs, total %.2fs, %d chars",
+            "Reply: first token %.2fs, total %.2fs, %d chars, %d tool msgs",
             first if first is not None else -1.0,
             time.monotonic() - t0,
             len(reply),
+            sum(1 for m in turn if m["role"] == "tool"),
         )
-        if reply:
-            if stop.is_set():
-                reply += " (interrompu)"
-                raw = [reply]
-            elif brackets.removed:
-                raw = [reply]  # don't let an echoed stamp reinforce itself
-            self._record(user_text, user_msg, "".join(raw), reply)
+        if not reply:
+            return
+        if stop.is_set() or removed:
+            # Don't let an interruption / echoed stamp reinforce itself: the
+            # final assistant message becomes what was actually said.
+            final = reply + (" (interrompu)" if stop.is_set() else "")
+            if turn[-1]["role"] == "assistant" and not turn[-1].get("tool_calls"):
+                turn[-1] = {"role": "assistant", "content": final}
+            else:
+                turn.append({"role": "assistant", "content": final})
+            reply = final
+        elif turn[-1]["role"] != "assistant":
+            turn.append({"role": "assistant", "content": reply})
+        self._record(user_text, turn, reply)
 
-    def _record(self, user_text: str, user_msg: str, raw: str, reply: str) -> None:
+    @staticmethod
+    def _emit_all(gen: Any, emit: Any) -> Iterator[str]:
+        """Re-yield a sub-generator's text through ``emit``; return its value."""
+        try:
+            while True:
+                yield emit(next(gen))
+        except StopIteration as done:
+            return done.value
+
+    def record_spoken(self, text: str) -> None:
+        """Remember something said unprompted (reminder fired, task done)."""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._append_turn([{"role": "assistant", "content": text}])
+        self._journal.append({"type": "spoken", "assistant": text})
+
+    def _append_turn(self, turn: list[dict[str, Any]]) -> None:
         with self._lock:
-            self._history.append((user_msg, raw))
+            self._history.append(turn)
             limit = max(1, self.bcfg.max_history_turns)
             if len(self._history) > limit:
                 # Trim in one go to ~2/3 so the prompt cache breaks rarely, and
                 # refresh the system prompt (new facts) since it breaks anyway.
                 del self._history[: len(self._history) - max(1, limit * 2 // 3)]
                 self._static_prompt = self._build_static_prompt()
+
+    def _record(self, user_text: str, turn: list[dict[str, Any]], reply: str) -> None:
+        self._append_turn(turn)
+        with self._lock:
             self._session_exchanges.append((user_text, reply))
-            self._journal.append(
-                {"type": "exchange", "user": user_text, "assistant": reply}
-            )
+            event: dict[str, Any] = {
+                "type": "exchange",
+                "user": user_text,
+                "assistant": reply,
+            }
+            tools = [
+                {"name": _call_name(c), "args": _call_args(c)}
+                for m in turn
+                for c in m.get("tool_calls") or []
+            ]
+            if tools:
+                event["tools"] = tools
+            self._journal.append(event)
             self._state["last_exchange"] = _now().isoformat(timespec="seconds")
             self._state["last_seen"] = self._state["last_exchange"]
             _write_json(self._self_path, self._state)
 
     def _complete(
-        self, messages: list[dict[str, str]], timeout: float, **options: Any
+        self, messages: list[dict[str, Any]], timeout: float, **options: Any
     ) -> str:
         r = self._client.post(
             "/api/chat",
-            json=self._payload(messages, False, **options),
+            json=self._payload(messages, False, tools=False, **options),
             timeout=httpx.Timeout(timeout, connect=min(timeout, 2.0)),
         )
         r.raise_for_status()
@@ -844,7 +1388,12 @@ class Brain:
         with self._lock:
             # Keep it in the transcript: continuity, and the cache stays valid.
             if not self._history:
-                self._history.append((msg, raw))
+                self._history.append(
+                    [
+                        {"role": "user", "content": msg},
+                        {"role": "assistant", "content": raw},
+                    ]
+                )
         return text
 
     def shutdown(self) -> None:
@@ -885,4 +1434,5 @@ class Brain:
         )
         self._state["last_seen"] = end.isoformat(timespec="seconds")
         _write_json(self._self_path, self._state)
+        self._pool.shutdown(wait=False, cancel_futures=True)
         self._client.close()

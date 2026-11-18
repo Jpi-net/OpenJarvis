@@ -267,6 +267,10 @@ class Ears:
         self._stream = None
         self._stream_lock = threading.Lock()
         self._muted = threading.Event()
+        # Barge-in: while muted (assistant speaking), chunks go to a separate
+        # queue that only the interrupt detector reads.
+        self._barge = threading.Event()
+        self._barge_queue: queue.Queue = queue.Queue(maxsize=int(5 / CHUNK_SECONDS))
         self._wake: WakeWordDetector | None = None
         self._vad: SpeechProbability | None = None
         self._whisper = None
@@ -380,6 +384,11 @@ class Ears:
                 if status:
                     logger.debug("input status: %s", status)
                 if self._muted.is_set():
+                    if self._barge.is_set():
+                        try:
+                            self._barge_queue.put_nowait(indata[:, 0].copy())
+                        except queue.Full:
+                            pass
                     return
                 try:
                     self._queue.put_nowait(indata[:, 0].copy())
@@ -469,6 +478,37 @@ class Ears:
             if self._wake.process(chunk):
                 logger.info("Wake word detected")
                 return True
+
+    def listen_for_interrupt(self, stop: threading.Event, threshold: float) -> bool:
+        """While muted (assistant speaking), watch for the wake word.
+
+        Returns True if the user said the wake word (barge-in), False once
+        ``stop`` is set. Uses a stricter threshold than normal wake-up because
+        the microphone also hears the assistant's own voice.
+        """
+        self._load_wake()
+        assert self._wake is not None
+        while True:
+            try:
+                self._barge_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._wake.reset()
+        self._barge.set()
+        try:
+            while not stop.is_set():
+                try:
+                    chunk = self._barge_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                score = self._wake.score(chunk)
+                if score >= threshold:
+                    logger.info("Barge-in: wake word while speaking (%.2f)", score)
+                    return True
+            return False
+        finally:
+            self._barge.clear()
+            self._wake.reset()
 
     def record_utterance(
         self,

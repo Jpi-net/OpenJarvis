@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 
 from openjarvis.orb.config import DATA_DIR, JarvisConfig
+from openjarvis.orb.toolkit import Notifier, ToolBox
 
 log = logging.getLogger("openjarvis.orb.app")
 
@@ -75,14 +76,41 @@ class OrbApp:
         self.ears: Any = None
         self.voice: Any = None
         self.brain: Any = None
+        self.notifier = Notifier()
+        self._closables: list[Any] = []  # reflexes / hands background threads
+        self._speak_lock = threading.Lock()
 
     # -- setup -------------------------------------------------------------
+
+    def _build_toolbox(self) -> ToolBox:
+        """Reflexes (instant local actions) + hands (delegated long tasks)."""
+        box = ToolBox()
+        if self.cfg.actions.enabled:
+            try:
+                from openjarvis.orb.actions import Reflexes
+
+                reflexes = Reflexes(self.cfg, self.notifier)
+                box.add(*reflexes.tools())
+                self._closables.append(reflexes)
+            except Exception:
+                log.exception("Reflexes unavailable")
+        if self.cfg.hands.enabled:
+            try:
+                from openjarvis.orb.hands import Hands
+
+                hands = Hands(self.cfg, self.notifier)
+                box.add(*hands.tools())
+                self._closables.append(hands)
+            except Exception:
+                log.exception("Hands unavailable")
+        log.info("Abilities: %s", ", ".join(box.tools) or "none")
+        return box
 
     def _warm_up(self) -> None:
         from openjarvis.orb.brain import Brain
         from openjarvis.orb.voice import Voice
 
-        self.brain = Brain(self.cfg)
+        self.brain = Brain(self.cfg, self._build_toolbox())
         self.voice = Voice(self.cfg.voice)
         parts: list[Any] = [self.brain, self.voice]
         if not self.text_input:
@@ -99,34 +127,101 @@ class OrbApp:
 
     # -- conversation ------------------------------------------------------
 
-    def _say(self, chunks: Any) -> None:
-        """Speak a reply (iterable of text deltas) with the orb in sync."""
-        if self.ears is not None:
-            self.ears.mute(True)
-        try:
-            self.voice.speak_stream(
-                chunks,
-                self.stop,
-                level_cb=self.ui.set_level,
-                on_first_audio=lambda: self.ui.set_state("speaking"),
-            )
-        finally:
-            self.ui.set_level(0.0)
-            if self.ears is not None:
-                self.ears.mute(False)
+    def _say(self, chunks: Any) -> bool:
+        """Speak a reply (iterable of text deltas) with the orb in sync.
 
-    def _answer(self, text: str) -> None:
+        Returns True if the user interrupted by saying the wake word.
+        """
+        interrupt = threading.Event()  # stops the voice
+        done = threading.Event()  # stops the helper threads
+        barged = threading.Event()
+
+        def relay_stop() -> None:  # app shutdown also stops the voice
+            while not done.is_set():
+                if self.stop.wait(0.1):
+                    interrupt.set()
+                    return
+
+        def watch_barge_in() -> None:
+            if self.ears.listen_for_interrupt(done, self.cfg.ears.barge_in_threshold):
+                barged.set()
+                interrupt.set()
+
+        with self._speak_lock:
+            if self.ears is not None:
+                self.ears.mute(True)
+            helpers = [threading.Thread(target=relay_stop, daemon=True)]
+            if self.ears is not None and self.cfg.ears.barge_in:
+                helpers.append(threading.Thread(target=watch_barge_in, daemon=True))
+            for t in helpers:
+                t.start()
+            try:
+                self.voice.speak_stream(
+                    chunks,
+                    interrupt,
+                    level_cb=self.ui.set_level,
+                    on_first_audio=lambda: self.ui.set_state("speaking"),
+                )
+            finally:
+                done.set()
+                for t in helpers:
+                    t.join(timeout=1.0)
+                self.ui.set_level(0.0)
+                if self.ears is not None:
+                    self.ears.mute(False)
+        return barged.is_set()
+
+    def _announce_pending(self) -> bool:
+        """Say what background work wants to say. True if something was said."""
+        items = self.notifier.drain()
+        if not items:
+            return False
+        text = " ".join(a.text for a in items)
+        self.ui.set_state("thinking")
+        self._say(iter([text]))
+        if hasattr(self.brain, "record_spoken"):
+            self.brain.record_spoken(text)
+        return True
+
+    def _answer(self, text: str) -> bool:
         log.info("user: %s", text)
         self.ui.set_state("thinking")
-        self._say(self.brain.stream_reply(text, self.stop))
+        return self._say(self.brain.stream_reply(text, self.stop))
+
+    def _wait_wake_or_news(self) -> str:
+        """Block until the wake word ("wake"), an announcement ("news") or
+        shutdown ("stop")."""
+        wake_stop = threading.Event()
+
+        def relay() -> None:
+            while not wake_stop.is_set():
+                if self.stop.is_set() or self.notifier.pending.is_set():
+                    wake_stop.set()
+                    return
+                time.sleep(0.05)
+
+        threading.Thread(target=relay, daemon=True).start()
+        try:
+            heard = self.ears.wait_for_wake_word(wake_stop)
+        finally:
+            wake_stop.set()
+        if heard:
+            return "wake"
+        return "stop" if self.stop.is_set() else "news"
 
     def _voice_loop(self) -> None:
         follow_up = self.cfg.ears.follow_up_seconds
         while not self.stop.is_set():
             self.ui.set_state("idle")
-            if not self.ears.wait_for_wake_word(self.stop):
+            event = self._wait_wake_or_news()
+            if event == "stop":
                 return
-            start_timeout = max(follow_up, 5.0)
+            if event == "news":
+                if not self._announce_pending():
+                    continue
+                start_timeout = follow_up  # let the user react to the news
+            else:
+                start_timeout = max(follow_up, 5.0)
             # Conversation: keep listening without the wake word while the
             # user keeps talking within the follow-up window.
             while not self.stop.is_set():
@@ -141,10 +236,18 @@ class OrbApp:
                 text = self.ears.transcribe(audio).strip()
                 if not text:
                     break
-                self._answer(text)
+                self._answer(text)  # barge-in or not, listen right after
+                self._announce_pending()
                 start_timeout = follow_up
 
     def _text_loop(self) -> None:
+        def announcer() -> None:
+            while not self.stop.is_set():
+                if self.notifier.pending.wait(0.2):
+                    self._announce_pending()
+                    self.ui.set_state("idle")
+
+        threading.Thread(target=announcer, daemon=True).start()
         while not self.stop.is_set():
             self.ui.set_state("idle")
             try:
@@ -185,7 +288,7 @@ class OrbApp:
                 self.brain.shutdown()
             except Exception:
                 log.exception("Brain shutdown failed")
-        for part in (self.ears, self.voice):
+        for part in (*self._closables, self.ears, self.voice):
             if part is not None and hasattr(part, "close"):
                 try:
                     part.close()

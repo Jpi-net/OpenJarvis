@@ -9,6 +9,14 @@ Engines:
 - ``piper`` (default): local neural TTS. The voice is downloaded once from
   Hugging Face (``rhasspy/piper-voices``) into ``DATA_DIR/piper/``.
 - ``say``: macOS built-in voices. Also used automatically when piper fails.
+
+A multi-speaker piper voice takes its speaker after a ``#``:
+``fr_FR-upmc-medium#pierre`` (a name of the voice's speaker map) or
+``fr_FR-mls-medium#36`` (a numeric speaker id, when it is not a map name).
+
+``cfg.effect`` names a post-processing preset of ``voice_fx`` (``none``,
+``jarvis``...), applied to each synthesized chunk with state kept across the
+chunks of a reply.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from openjarvis.orb import voice_fx
 from openjarvis.orb.config import DATA_DIR, VoiceConfig
 
 if TYPE_CHECKING:
@@ -347,6 +356,37 @@ def _voice_url_path(name: str) -> str:
     return f"{lang}/{locale}/{speaker}/{quality}/{name}"
 
 
+def split_voice_name(spec: str) -> tuple[str, str | None]:
+    """``fr_FR-upmc-medium#pierre`` -> ``("fr_FR-upmc-medium", "pierre")``."""
+    name, sep, speaker = (spec or "").strip().partition("#")
+    return name.strip(), (speaker.strip() or None) if sep else None
+
+
+def resolve_speaker(
+    speaker: str | None, speaker_id_map: dict[str, int], num_speakers: int
+) -> int | None:
+    """Speaker id for a multi-speaker voice (map name first, then numeric id)."""
+    if num_speakers <= 1:
+        if speaker:
+            logger.warning("Voice has a single speaker; ignoring %r", speaker)
+        return None
+    if not speaker:
+        return 0
+    if speaker in speaker_id_map:
+        return int(speaker_id_map[speaker])
+    lowered = {k.lower(): v for k, v in speaker_id_map.items()}
+    if speaker.lower() in lowered:
+        return int(lowered[speaker.lower()])
+    if speaker.isdigit() and int(speaker) < num_speakers:
+        return int(speaker)
+    logger.warning(
+        "Unknown speaker %r (known: %s); using speaker 0",
+        speaker,
+        ", ".join(list(speaker_id_map)[:10]) or f"0..{num_speakers - 1}",
+    )
+    return 0
+
+
 def _download(url: str, dest: Path) -> None:
     import httpx
     import truststore
@@ -376,6 +416,7 @@ class Voice:
         self._output: _SoundDeviceSink | None = None
         self._speak_lock = threading.Lock()
         self._speed = max(0.3, min(3.0, float(cfg.speed or 1.0)))
+        self._fx = voice_fx.design("none", self._sample_rate)
 
     # -- loading -----------------------------------------------------------
 
@@ -400,12 +441,26 @@ class Voice:
             if self._engine != "piper":
                 self._engine = "say"
                 self._sample_rate = _SAY_SAMPLE_RATE
+            self._load_fx()
             self._loaded = True
+
+    def _load_fx(self) -> None:
+        try:
+            self._fx = voice_fx.design(self.cfg.effect, self._sample_rate)
+            self._fx.new()  # import scipy now, not on the first reply
+        except Exception:
+            logger.exception("Voice effect %r unavailable", self.cfg.effect)
+            self._fx = voice_fx.design("none", self._sample_rate)
+        if self._piper is not None:
+            # The pitch drop stretches the audio: speak faster to compensate.
+            self._syn_config.length_scale = self._fx.pitch_ratio / self._speed
+        if self._fx.enabled:
+            logger.info("Voice effect: %s", self._fx.name)
 
     def _load_piper(self) -> None:
         from piper import PiperVoice, SynthesisConfig
 
-        name = self.cfg.piper_voice
+        name, speaker = split_voice_name(self.cfg.piper_voice)
         model = PIPER_DIR / f"{name}.onnx"
         config = PIPER_DIR / f"{name}.onnx.json"
         base = f"{_HF_BASE}/{_voice_url_path(name)}"
@@ -415,11 +470,18 @@ class Voice:
             _download(f"{base}.onnx?download=true", model)
         t0 = time.perf_counter()
         self._piper = PiperVoice.load(model, config_path=config)
-        self._syn_config = SynthesisConfig(length_scale=1.0 / self._speed)
-        self._sample_rate = int(self._piper.config.sample_rate)
+        pcfg = self._piper.config
+        speaker_id = resolve_speaker(
+            speaker, dict(pcfg.speaker_id_map or {}), int(pcfg.num_speakers or 1)
+        )
+        self._syn_config = SynthesisConfig(
+            speaker_id=speaker_id, length_scale=1.0 / self._speed
+        )
+        self._sample_rate = int(pcfg.sample_rate)
         logger.info(
-            "Piper voice %s loaded in %.2fs (%d Hz)",
+            "Piper voice %s%s loaded in %.2fs (%d Hz)",
             name,
+            "" if speaker_id is None else f" (speaker {speaker_id})",
             time.perf_counter() - t0,
             self._sample_rate,
         )
@@ -457,7 +519,7 @@ class Voice:
     def _synthesize_say(self, text: str) -> Iterable[np.ndarray]:
         import numpy as np
 
-        rate = int(_SAY_BASE_RATE * self._speed)
+        rate = int(_SAY_BASE_RATE * self._speed / self._fx.pitch_ratio)
         fd, path = tempfile.mkstemp(suffix=".wav", prefix="orb-say-")
         os.close(fd)
         try:
@@ -576,6 +638,8 @@ class Voice:
 
         def synth_worker() -> None:
             gap = np.zeros(int(self._sample_rate * _SENTENCE_GAP_S), dtype=np.float32)
+            fx = self._fx.new()  # fresh filter state for each reply
+            finished = False
             try:
                 while not (stop.is_set() or done.is_set()):
                     try:
@@ -591,12 +655,16 @@ class Voice:
                     for audio in self._synthesize(text):
                         if stop.is_set() or done.is_set():
                             return
+                        audio = fx.process(audio)
                         if not put_audio((text if first else "", audio)):
                             return
                         first = False
-                    if not first and not put_audio(("", gap)):
+                    if not first and not put_audio(("", fx.process(gap))):
                         return
+                finished = True
             finally:
+                if finished and fx.enabled:
+                    put_audio(("", fx.flush()))
                 put_audio(None)
 
         threads = [
