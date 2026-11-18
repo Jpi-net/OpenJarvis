@@ -233,6 +233,9 @@ class OrbApp:
                 if audio is None:
                     break
                 self.ui.set_state("thinking")
+                if hasattr(self.voice, "prepare"):
+                    # Open the online TTS connection while we transcribe/think.
+                    self.voice.prepare()
                 text = self.ears.transcribe(audio).strip()
                 if not text:
                     break

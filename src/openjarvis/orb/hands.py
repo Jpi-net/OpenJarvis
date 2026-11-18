@@ -9,21 +9,30 @@ workspace (``~/Jarvis/<YYYY-MM-DD>-<slug>/``), return at once, follow its
 
 Safety model (verified on macOS with Claude Code 2.1.327):
 
-- ``--permission-mode acceptEdits``: the Write/Edit tools are auto-approved
-  only inside the working directory (the task folder). Write/Edit are *not*
-  put in ``--allowedTools`` on purpose: an allow rule would approve them for
-  any path on disk.
-- Built-in sandbox (``--settings`` ``sandbox.enabled``, macOS Seatbelt) for
-  every Bash command: writes confined to the task folder (+ temp dirs),
-  secrets unreadable, network limited to a developer allow-list (package
-  registries, GitHub, CDNs…). ``autoAllowBashIfSandboxed`` lets commands run
-  without prompts; ``allowUnsandboxedCommands: false`` removes the escape
-  hatch; ``failIfUnavailable`` refuses to start rather than run unsandboxed.
-- ``--permission-prompts none``: anything that would need a human approval is
-  denied automatically, so a job never hangs waiting for an answer.
-- ``--setting-sources project``: the user's personal Claude Code settings
-  (hooks waiting on a GUI, plugins, permissive allow rules) do not apply.
-- WebFetch / WebSearch are allowed so the job can read documentation.
+- ``--permission-mode bypassPermissions``: no tool ever waits for an
+  approval, so Bash really runs (npm, python, git…). What keeps it safe:
+- Built-in OS sandbox (``--settings`` ``sandbox``, macOS Seatbelt) around
+  every Bash command: writes confined to the task folder and a per-task temp
+  dir, secrets unreadable, outbound network limited to a broad allow-list
+  (``ALLOWED_DOMAINS`` + ``hands.extra_domains``). ``failIfUnavailable``
+  refuses to start without it, ``allowUnsandboxedCommands: false`` removes
+  the escape hatch.
+- A PreToolUse hook (``hands_guard.py``) fences the file tools, which the
+  sandbox does not cover: Write/Edit outside the task folder (or into its
+  ``.claude``) and Read of secrets are denied, as is any Bash call asking to
+  leave the sandbox. A SessionStart hook proves the settings were accepted
+  (``-p`` mode silently drops invalid settings): no proof, no job.
+- ``--setting-sources project``: the user's personal settings (a GUI
+  PermissionRequest hook with a one-day timeout, plugins, work MCP servers)
+  do not apply. The claude.ai connectors (Notion, Drive, Gmail…) come from
+  the account and still load; ``MCP_CONNECTION_NONBLOCKING=false`` makes
+  them ready before the first turn. Playwright (browser) is passed with
+  ``--mcp-config``.
+- Cron / remote triggers are disallowed: nothing outlives the job.
+
+``ask_services`` is the quick path: a blocking ``claude -p`` with only the
+connectors and web tools (no Bash, no file writes) that answers in one or
+three spoken sentences.
 """
 
 from __future__ import annotations
@@ -32,9 +41,12 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -45,6 +57,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from openjarvis.orb import config as orb_config
+from openjarvis.orb import hands_guard as guard
 from openjarvis.orb.config import JarvisConfig
 from openjarvis.orb.toolkit import Notifier, Tool
 
@@ -54,33 +67,73 @@ CLAUDE_PATH_ENV = "JARVIS_CLAUDE_PATH"
 MAX_TASK_SECONDS = 60 * 60  # hard wall-clock limit per job
 KEEP_TASKS = 50  # entries kept in tasks.json
 
-# Hosts sandboxed shell commands may reach (WebFetch is not concerned).
+SERVICES_TIMEOUT_S = 90.0  # ask_services is synchronous (brain waits 120 s)
+SERVICES_MODEL = "sonnet"  # fast and reliable with MCP tools
+SERVICES_BUDGET_USD = 0.5
+GUARD_TOKEN = guard.GUARD_TOKEN
+
+# Hosts sandboxed shell commands may reach (WebFetch and MCP servers are not
+# concerned). Claude Code refuses "*" or "*.com" (and then silently ignores
+# the whole settings JSON), so the list is broad but explicit; "*.x.y" does
+# not match "x.y" itself, hence the pairs.
 ALLOWED_DOMAINS = [
     "localhost",
+    # code hosting, package registries, toolchains
     "github.com",
     "*.github.com",
     "*.githubusercontent.com",
     "ghcr.io",
+    "*.ghcr.io",
     "gitlab.com",
+    "*.gitlab.com",
     "bitbucket.org",
     "registry.npmjs.org",
     "*.npmjs.org",
+    "*.npmjs.com",
     "registry.yarnpkg.com",
     "*.yarnpkg.com",
     "nodejs.org",
+    "*.nodejs.org",
     "bun.sh",
+    "deno.land",
+    "*.deno.land",
+    "jsr.io",
+    "*.jsr.io",
+    "esm.sh",
     "pypi.org",
     "*.pypi.org",
     "files.pythonhosted.org",
     "*.pythonhosted.org",
     "astral.sh",
     "*.astral.sh",
+    "anaconda.org",
+    "*.anaconda.org",
+    "conda.anaconda.org",
     "crates.io",
     "*.crates.io",
+    "static.rust-lang.org",
+    "sh.rustup.rs",
     "proxy.golang.org",
     "sum.golang.org",
+    "go.dev",
+    "rubygems.org",
+    "*.rubygems.org",
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "plugins.gradle.org",
+    "services.gradle.org",
+    "packagist.org",
+    "*.packagist.org",
     "formulae.brew.sh",
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "*.docker.io",
+    "*.docker.com",
+    "cdn.playwright.dev",
+    "playwright.download.prss.microsoft.com",
+    # CDNs, fonts, models
     "cdn.jsdelivr.net",
+    "*.jsdelivr.net",
     "unpkg.com",
     "cdnjs.cloudflare.com",
     "fonts.googleapis.com",
@@ -88,11 +141,114 @@ ALLOWED_DOMAINS = [
     "huggingface.co",
     "*.huggingface.co",
     "*.hf.co",
+    "ollama.com",
+    "*.ollama.com",
+    # AI APIs
+    "api.anthropic.com",
+    "api.openai.com",
+    "api.mistral.ai",
+    "api.groq.com",
+    "openrouter.ai",
+    "api.deepseek.com",
+    "api.elevenlabs.io",
+    "api.replicate.com",
+    # Google, Microsoft, Apple
+    "googleapis.com",
+    "*.googleapis.com",
+    "accounts.google.com",
+    "oauth2.googleapis.com",
+    "www.google.com",
+    "graph.microsoft.com",
+    "login.microsoftonline.com",
+    "login.live.com",
+    "*.sharepoint.com",
+    "outlook.office.com",
+    "outlook.office365.com",
+    "api.apple-cloudkit.com",
+    # productivity, messaging, dev services
+    "api.notion.com",
+    "notion.so",
+    "*.notion.so",
+    "slack.com",
+    "*.slack.com",
+    "discord.com",
+    "*.discord.com",
+    "api.telegram.org",
+    "api.twilio.com",
+    "api.sendgrid.com",
+    "api.mailgun.net",
+    "api.linear.app",
+    "*.atlassian.net",
+    "api.atlassian.com",
+    "api.trello.com",
+    "api.airtable.com",
+    "api.figma.com",
+    "api.todoist.com",
+    "api.dropboxapi.com",
+    "content.dropboxapi.com",
+    "api.box.com",
+    "api.zoom.us",
+    "api.calendly.com",
+    "api.hubapi.com",
+    "api.stripe.com",
+    "api.paypal.com",
+    "api-m.paypal.com",
+    "api.spotify.com",
+    "accounts.spotify.com",
+    "api.vercel.com",
+    "api.netlify.com",
+    "*.supabase.co",
+    "*.firebaseio.com",
+    "firestore.googleapis.com",
+    "amazonaws.com",
+    "*.amazonaws.com",
+    "api.cloudflare.com",
+    "*.workers.dev",
+    "api.digitalocean.com",
+    "api.heroku.com",
+    "*.herokuapp.com",
+    "*.vercel.app",
+    "*.netlify.app",
+    "*.github.io",
+    # open data
+    "*.open-meteo.com",
+    "open-meteo.com",
+    "api.openweathermap.org",
+    "wttr.in",
+    "*.openstreetmap.org",
+    "nominatim.openstreetmap.org",
+    "*.wikipedia.org",
+    "*.wikimedia.org",
+    "www.wikidata.org",
+    "api.coingecko.com",
+    "api.frankfurter.app",
+    "api.exchangerate.host",
+    "irail.be",
+    "api.irail.be",
+    "data.gov",
+    "data.europa.eu",
+    "ipinfo.io",
+    "ifconfig.me",
+    "httpbin.org",
+    "example.com",
+    "example.org",
 ]
-SECRET_PATHS = ["~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gh", "~/Library/Keychains"]
-# Tools approved without a prompt. Write/Edit deliberately absent (see above).
-ALLOWED_TOOLS = ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite"]
+# Sandboxed tools must not read these either (shared with the guard hook).
+SECRET_PATHS = guard.SECRET_PATHS
+# Built-in tools a job cannot use: they schedule work that outlives the job.
+DISALLOWED_TOOLS = [
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "RemoteTrigger",
+    "ScheduleWakeup",
+    "PushNotification",
+    "EnterWorktree",
+    "ExitWorktree",
+]
+SERVICE_TOOLS = ["WebSearch", "WebFetch", "ToolSearch"]
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+_DOMAIN_RE = re.compile(r"^(\*\.)?[a-z0-9-]+(\.[a-z0-9-]+)+$|^localhost$")
 
 STATUS_FR = {
     "running": "en cours",
@@ -222,6 +378,8 @@ class Task:
     last_text: str = field(default="", repr=False, compare=False)
     tool_uses: int = field(default=0, repr=False, compare=False)
     timer: Any = field(default=None, repr=False, compare=False)
+    tmpdir: str = field(default="", repr=False, compare=False)
+    guard_ok: bool = field(default=False, repr=False, compare=False)
 
     PERSISTED = (
         "id title goal folder status started ended summary cost_usd files note "
@@ -323,15 +481,46 @@ class Hands:
         }
         return [
             Tool(
+                name="ask_services",
+                description=(
+                    "Consulte ou modifie tout de suite les services en ligne de "
+                    "l'utilisateur : agenda (rendez-vous, « qu'est-ce que j'ai "
+                    "demain ? », ajouter un événement), mails (« ai-je des mails "
+                    "importants ? », chercher, résumer, écrire un brouillon), "
+                    "Google Drive (trouver un document), Notion (chercher, créer "
+                    "une page). À utiliser pour une question ou une action rapide "
+                    "sur ces services ; répond en une à trois phrases dans ce tour "
+                    "(jusqu'à une minute). Pas pour construire ou automatiser : "
+                    "pour ça, delegate_task."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "request": {
+                            "type": "string",
+                            "description": "La demande complète de l'utilisateur, "
+                            "avec dates, noms et précisions (ex. « ajoute un "
+                            "rendez-vous chez le dentiste jeudi à 10 h »).",
+                        }
+                    },
+                    "required": ["request"],
+                },
+                func=self.ask_services,
+                progress="Je m'en occupe…",
+            ),
+            Tool(
                 name="delegate_task",
                 description=(
                     "Confie un vrai travail sur l'ordinateur à un agent autonome "
                     "(Claude Code) qui tourne en arrière-plan : construire, coder, "
                     "créer un site, une appli ou un script, installer un outil, "
-                    "automatiser quelque chose, se connecter à un service ou une "
-                    "API, tout travail en plusieurs étapes. À utiliser dès que la "
-                    "demande dépasse une action instantanée. Rend la main tout de "
-                    "suite ; je préviens l'utilisateur à voix haute quand c'est fini."
+                    "automatiser quelque chose, brancher un nouveau service ou une "
+                    "API, naviguer sur un site pour faire une démarche, tout "
+                    "travail long ou en plusieurs étapes (il peut aussi utiliser "
+                    "l'agenda, les mails, le Drive et Notion). Pour une simple "
+                    "question ou action rapide sur ces services, utilise plutôt "
+                    "ask_services. Rend la main tout de suite ; je préviens "
+                    "l'utilisateur à voix haute quand c'est fini."
                 ),
                 parameters={
                     "type": "object",
@@ -371,8 +560,7 @@ class Hands:
                     "l'annuler ou l'arrêter."
                 ),
                 parameters=which,
-                func=self.cancel_task,
-                confirm=True,
+                func=self.cancel_task,  # the user asks for it: no confirmation
             ),
             Tool(
                 name="task_result",
@@ -424,24 +612,85 @@ class Hands:
             names = ", ".join(f"« {t.title} »" for t in running)
             return (
                 f"J'ai déjà {len(running)} tâche{'s' if len(running) > 1 else ''} "
-                f"en cours ({names}). Attends qu'une se termine ou annules-en une."
+                f"en cours ({names}). Attendez qu'une se termine ou annulez-en une."
             )
         folder = self._new_folder(title)
         task = Task(id=uuid.uuid4().hex[:8], title=title, goal=goal, folder=str(folder))
         task.note = "il démarre"
         try:
+            task.tmpdir = tempfile.mkdtemp(prefix=f"jarvis-{task.id}-")
             self._spawn(task, claude)
         except OSError as exc:
             log.exception("Could not start Claude Code")
+            if task.tmpdir:
+                shutil.rmtree(task.tmpdir, ignore_errors=True)
             return f"Je n'ai pas pu lancer la tâche : {exc}"
         with self._lock:
             self._tasks.append(task)
         self._save()
         log.info("Task %s started in %s", task.id, folder)
         return (
-            "C'est lancé. Je te préviens quand c'est prêt. "
+            "C'est lancé. Je vous préviens quand c'est prêt. "
             f"(Tâche « {title} », dans {self._spoken_folder(task)}.)"
         )
+
+    def ask_services(self, request: str) -> str:
+        """Blocking ``claude -p`` limited to the connectors + web tools."""
+        request = (request or "").strip()
+        if not request:
+            return "Il me faut la demande à transmettre."
+        claude = find_claude(self._claude_arg)
+        if claude is None:
+            return "Je ne trouve pas Claude Code, je ne peux pas joindre vos services."
+        cwd = self.data_dir / "hands" / "services"
+        cwd.mkdir(parents=True, exist_ok=True)
+        cmd = self._services_command(claude)
+        t0 = time.monotonic()
+        try:
+            proc = subprocess.Popen(  # noqa: S603 - the user's claude binary
+                cmd,
+                cwd=cwd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self._base_env(),
+                start_new_session=True,
+            )
+        except OSError as exc:
+            log.exception("Could not start Claude Code for services")
+            return f"Je n'ai pas pu joindre vos services : {exc}"
+        try:
+            out, err = proc.communicate(
+                request.encode("utf-8"), timeout=SERVICES_TIMEOUT_S
+            )
+        except subprocess.TimeoutExpired:
+            self._kill_group(proc)
+            log.warning("ask_services timed out after %.0fs", SERVICES_TIMEOUT_S)
+            return "Vos services mettent trop de temps à répondre, j'ai abandonné."
+        elapsed = time.monotonic() - t0
+        result: dict[str, Any] = {}
+        try:
+            parsed = json.loads(out.decode("utf-8", "replace").strip() or "{}")
+            result = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            pass
+        text = _clean_spoken(str(result.get("result") or ""))
+        log.info(
+            "ask_services %.1fs cost %s turns %s: %s",
+            elapsed,
+            result.get("total_cost_usd"),
+            result.get("num_turns"),
+            text[:160],
+        )
+        if result.get("is_error") or result.get("subtype") != "success" or not text:
+            subtype = str(result.get("subtype") or "")
+            if "budget" in subtype:
+                return "La demande coûtait trop cher, je l'ai arrêtée."
+            low = err.decode("utf-8", "replace").lower()
+            if "log in" in low or "login" in low:
+                return "Claude Code n'est pas connecté à votre compte."
+            return text or "Je n'ai pas réussi à joindre vos services."
+        return text
 
     def task_status(self, which: str = "") -> str:
         task = self._find(which, prefer_running=True)
@@ -466,7 +715,7 @@ class Hands:
         if self._files_phrase(task):
             text += f" Fichiers : {self._files_phrase(task)}."
         if task.status == "done":
-            text += " Demande-moi le résultat pour le détail."
+            text += " Demandez-moi le résultat pour le détail."
         elif task.error:
             text += f" {task.error}"
         return text
@@ -548,23 +797,113 @@ class Hands:
             self._flags = set(re.findall(r"--[a-z][a-z-]+", out))
         return self._flags
 
-    def _settings(self) -> dict[str, Any]:
+    def _domains(self) -> list[str]:
+        """Default allow-list + ``hands.extra_domains`` (invalid ones dropped:
+        a single bad entry would make Claude Code ignore all the settings)."""
+        domains = list(ALLOWED_DOMAINS)
+        for raw in getattr(self.hcfg, "extra_domains", None) or []:
+            name = str(raw).strip().lower()
+            too_broad = name.startswith("*.") and name.count(".") < 2  # "*.com"
+            if not _DOMAIN_RE.match(name) or too_broad:
+                log.warning("Ignoring invalid hands.extra_domains entry %r", raw)
+                continue
+            if name not in domains:
+                domains.append(name)
+        return domains
+
+    def _guard_command(self, *args: str) -> str:
+        script = Path(guard.__file__).resolve()
+        return " ".join(
+            shlex.quote(a) for a in (sys.executable, "-I", str(script), *args)
+        )
+
+    def _settings(self, task: Task) -> dict[str, Any]:
+        folder = str(Path(task.folder).resolve())
+        roots = [folder] + ([task.tmpdir] if task.tmpdir else [])
+        guard_args = [a for root in roots for a in ("--root", root)]
         return {
             "sandbox": {
                 "enabled": True,
                 "failIfUnavailable": True,
                 "autoAllowBashIfSandboxed": True,
                 "allowUnsandboxedCommands": False,
+                # The network intercepts TLS with a CA that Python >= 3.13
+                # rejects from a PEM bundle (strict X.509) and Go ignores:
+                # pip/uv (truststore), gh, Go tools need the macOS trust
+                # service. Only grants the trustd mach service.
+                "enableWeakerNetworkIsolation": True,
                 "network": {
-                    "allowedDomains": ALLOWED_DOMAINS,
+                    "allowedDomains": self._domains(),
                     "allowLocalBinding": True,  # dev servers on localhost
                 },
-                "filesystem": {"denyRead": SECRET_PATHS},
+                "filesystem": {
+                    "allowWrite": roots[1:],
+                    "denyWrite": [f"{folder}/.claude"],
+                    "denyRead": SECRET_PATHS,
+                },
             },
             "permissions": {
-                "deny": [f"Read({p}/**)" for p in SECRET_PATHS],
+                "deny": [f"Read({p}/**)" for p in SECRET_PATHS]
+                + [f"Read({p})" for p in SECRET_PATHS],
+            },
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": self._guard_command("--session-start"),
+                                "timeout": 20,
+                            }
+                        ]
+                    }
+                ],
+                "PreToolUse": [
+                    {
+                        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Read|Glob"
+                        "|Grep|Bash",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": self._guard_command(*guard_args),
+                                "timeout": 20,
+                            }
+                        ],
+                    }
+                ],
             },
         }
+
+    def _mcp_config(self) -> dict[str, Any]:
+        """MCP servers given explicitly (user settings are not loaded): the
+        Playwright browser when npx exists. Connectors come from the account."""
+        servers: dict[str, Any] = {}
+        npx = shutil.which("npx")
+        if npx and getattr(self.hcfg, "browser", True):
+            path = os.pathsep.join(
+                [str(Path(npx).parent), os.environ.get("PATH", "/usr/bin:/bin")]
+            )
+            servers["playwright"] = {
+                "command": npx,
+                "args": ["-y", "@playwright/mcp@latest"],
+                "env": {"PATH": path},
+            }
+        return {"mcpServers": servers}
+
+    def _disabled_services(self) -> list[str]:
+        """``hands.disabled_services`` ("Microsoft 365", "MaisonRadar"…) as
+        tool rules matching every tool of those connectors."""
+        rules = []
+        for raw in getattr(self.hcfg, "disabled_services", None) or []:
+            name = str(raw).strip()
+            if not name:
+                continue
+            if not name.startswith("mcp__"):
+                name = "mcp__claude_ai_" + re.sub(
+                    r"[^A-Za-z0-9_-]", "_", re.sub(r"^claude\.ai\s+", "", name)
+                )
+            rules.append(name)
+        return rules
 
     def _system_prompt(self, task: Task) -> str:
         spoken = self._spoken_folder(task)
@@ -573,38 +912,78 @@ class Hands:
             "pas ton écran et ne peut pas te répondre pendant que tu travailles.\n"
             "- Termine la tâche en autonomie, sans jamais poser de question : fais "
             "des choix raisonnables et note tes hypothèses dans le README.\n"
-            f"- Travaille uniquement dans le dossier courant ({task.folder}) ; ne "
-            "modifie rien ailleurs. Installe les dépendances localement (venv, "
-            "node_modules dans ce dossier), jamais globalement ni avec sudo.\n"
-            "- Les commandes shell tournent dans un bac à sable : écriture limitée "
-            "à ce dossier, réseau limité aux registres de paquets et à GitHub. Si "
-            "quelque chose est bloqué, trouve un autre moyen (WebFetch pour lire "
-            "de la doc, alternative locale) au lieu d'abandonner.\n"
-            "- Garde chaque commande shell simple, une par appel (pas de $?, de "
-            "$(...) ni d'enchaînements compliqués) : les commandes jugées "
-            "complexes sont refusées automatiquement. Si une commande est "
-            "refusée, reformule-la plus simplement ou écris un petit script dans "
-            "le dossier puis exécute-le.\n"
+            f"- Travaille dans le dossier courant ({task.folder}) ; ne modifie "
+            "rien ailleurs (fichiers temporaires : $TMPDIR). Installe les "
+            "dépendances localement (venv, node_modules dans ce dossier), jamais "
+            "globalement ni avec sudo.\n"
+            "- Tu peux lancer librement des commandes shell (npm, python, git, "
+            "curl…). Elles tournent dans un bac à sable : écriture limitée à ce "
+            "dossier, secrets illisibles, réseau limité à une large liste "
+            "(registres de paquets, GitHub, grandes API). Si un domaine est "
+            "bloqué, lis-le avec WebFetch ou trouve une autre voie au lieu "
+            "d'abandonner. Ne tente pas de sortir du bac à sable.\n"
+            "- Le réseau intercepte le TLS avec une autorité que Python 3.13+ "
+            "refuse depuis un fichier PEM : pip fonctionne, mais dans un script "
+            "Python qui fait du HTTPS, installe truststore et appelle "
+            "truststore.inject_into_ssl() au début (ne désactive jamais la "
+            "vérification des certificats).\n"
+            "- Services de l'utilisateur : tes outils MCP donnent accès à ses "
+            "connecteurs (agenda, mails, Google Drive, Notion…) et à un "
+            "navigateur (Playwright) ; certains outils se chargent via "
+            "ToolSearch. Lire et chercher est libre. Envoyer un message à "
+            "quelqu'un, supprimer des données ou payer : seulement si la demande "
+            "le dit explicitement.\n"
+            "- Si un service n'est pas connecté, trouve un moyen : son API "
+            "(script dans ce dossier, clé dans un fichier .env local), un serveur "
+            "MCP ou une bibliothèque installés ici. Si cela exige que "
+            "l'utilisateur se connecte lui-même (OAuth, clé d'API, mot de passe), "
+            "prépare tout puis dis-le clairement dans ton résumé, par exemple "
+            "« il faut que vous connectiez Microsoft 365 une fois dans Claude ».\n"
             "- Vérifie que le résultat fonctionne (lance-le ou teste-le si possible).\n"
             "- Écris un README.md dans le dossier : ce que c'est, comment l'ouvrir "
             "ou le lancer, tes hypothèses.\n"
             "- Ton tout dernier message doit être UNIQUEMENT un résumé en français "
-            "de 2 ou 3 phrases, écrit pour être LU À VOIX HAUTE : pas de markdown, "
+            "de 2 ou 3 phrases, écrit pour être LU À VOIX HAUTE en vouvoyant "
+            "l'utilisateur : pas de markdown, "
             "pas de liste, pas de chemin complet ni de code ; pour l'emplacement "
             f"dis « {spoken} ». Dis ce qui a été fait et comment l'utiliser."
         )
 
-    def _child_env(self, folder: Path) -> dict[str, str]:
+    def _services_prompt(self) -> str:
+        now = datetime.now().astimezone()
+        return (
+            "Tu es la partie « services » de Jarvis, un assistant vocal. Tu as "
+            "accès aux services connectés de l'utilisateur (agenda, mails, Google "
+            "Drive, Notion…) par tes outils MCP (certains se chargent via "
+            "ToolSearch), et au web.\n"
+            f"- Maintenant : {now:%A %d %B %Y, %H:%M} (fuseau {now:%Z}, UTC{now:%z}).\n"
+            "- Réponds vite : le moins d'appels d'outils possible, pas de question "
+            "en retour, aucune explication de ta démarche.\n"
+            "- Lire, chercher, résumer : libre. Créer ou modifier un élément de "
+            "l'utilisateur (rendez-vous, page, brouillon) : fais-le quand la "
+            "demande le demande. Actions irréversibles ou vers d'autres personnes "
+            "(envoyer un mail ou un message, inviter quelqu'un, supprimer, payer, "
+            "publier) : seulement si la demande le dit explicitement ; sinon "
+            "prépare un brouillon et dis-le.\n"
+            "- Si le service nécessaire n'est pas connecté ou demande une "
+            "connexion, dis lequel et qu'il faut le connecter une fois dans "
+            "Claude.\n"
+            "- N'invente rien : si tu ne trouves pas, dis-le.\n"
+            "- Ta réponse finale : une à trois phrases en français, écrites pour "
+            "être LUES À VOIX HAUTE, en vouvoyant l'utilisateur : pas de "
+            "markdown, pas de liste, pas d'URL, pas d'identifiant ni d'adresse "
+            "technique ; heures et dates dites naturellement (« jeudi à dix heures »)."
+        )
+
+    def _base_env(self) -> dict[str, str]:
         env = {
             k: v
             for k, v in os.environ.items()
             if not (k.startswith("CLAUDE") and k != "CLAUDE_CONFIG_DIR")
         }
-        cache = folder / ".cache"
-        env.setdefault("npm_config_cache", str(cache / "npm"))
-        env.setdefault("PIP_CACHE_DIR", str(cache / "pip"))
-        env.setdefault("UV_CACHE_DIR", str(cache / "uv"))
-        env.setdefault("YARN_CACHE_FOLDER", str(cache / "yarn"))
+        # Connect the claude.ai connectors before the first turn (in -p mode
+        # they load in the background otherwise and may be missing).
+        env["MCP_CONNECTION_NONBLOCKING"] = "false"
         bundle = _ca_bundle(self.data_dir)
         if bundle:
             for var in (
@@ -614,8 +993,31 @@ class Hands:
                 "PIP_CERT",
                 "NODE_EXTRA_CA_CERTS",
                 "GIT_SSL_CAINFO",
+                "AWS_CA_BUNDLE",
+                "CARGO_HTTP_CAINFO",
+                "DENO_CERT",
+                "HTTPLIB2_CA_CERTS",
             ):
                 env.setdefault(var, bundle)
+        return env
+
+    def _child_env(self, folder: Path, tmpdir: str = "") -> dict[str, str]:
+        env = self._base_env()
+        cache = folder / ".cache"
+        env.setdefault("npm_config_cache", str(cache / "npm"))
+        env.setdefault("PIP_CACHE_DIR", str(cache / "pip"))
+        env.setdefault("UV_CACHE_DIR", str(cache / "uv"))
+        env.setdefault("YARN_CACHE_FOLDER", str(cache / "yarn"))
+        if tmpdir:
+            env["TMPDIR"] = tmpdir
+            # ~/.npmrc is unreadable in the sandbox (tokens, work registry):
+            # give npm a clean public config instead.
+            npmrc = Path(tmpdir) / "npmrc"
+            lines = ["registry=https://registry.npmjs.org/"]
+            if env.get("NODE_EXTRA_CA_CERTS"):
+                lines.append(f"cafile={env['NODE_EXTRA_CA_CERTS']}")
+            npmrc.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            env["NPM_CONFIG_USERCONFIG"] = str(npmrc)
         return env
 
     def _command(self, task: Task, claude: str) -> list[str]:
@@ -627,17 +1029,20 @@ class Hands:
             "stream-json",
             "--verbose",
             "--permission-mode",
-            "acceptEdits",
+            "bypassPermissions",
             "--settings",
-            json.dumps(self._settings()),
+            json.dumps(self._settings(task)),
             "--append-system-prompt",
             self._system_prompt(task),
         ]
         optional: list[tuple[str, list[str]]] = [
             ("--permission-prompts", ["none"]),
             ("--setting-sources", ["project"]),
-            ("--strict-mcp-config", []),
+            ("--include-hook-events", []),
         ]
+        mcp = self._mcp_config()
+        if mcp["mcpServers"]:
+            optional.append(("--mcp-config", [json.dumps(mcp)]))
         if self.hcfg.model:
             optional.append(("--model", [self.hcfg.model]))
         if self.hcfg.max_budget_usd and self.hcfg.max_budget_usd > 0:
@@ -648,7 +1053,43 @@ class Hands:
             else:
                 log.warning("Claude Code has no %s flag, skipping it", flag)
         # Variadic option last; the prompt goes through stdin.
-        cmd += ["--allowedTools", ",".join(ALLOWED_TOOLS)]
+        cmd += [
+            "--disallowedTools",
+            ",".join(DISALLOWED_TOOLS + self._disabled_services()),
+        ]
+        return cmd
+
+    def _services_command(self, claude: str) -> list[str]:
+        flags = self._supported_flags(claude)
+        model = str(getattr(self.hcfg, "services_model", "") or SERVICES_MODEL)
+        budget = getattr(self.hcfg, "services_budget_usd", SERVICES_BUDGET_USD)
+        cmd = [
+            claude,
+            "-p",
+            "--output-format",
+            "json",
+            # No Bash and no file tools exist in this session (--tools), so
+            # bypassing prompts only lets the connectors and web tools run.
+            "--permission-mode",
+            "bypassPermissions",
+            "--append-system-prompt",
+            self._services_prompt(),
+        ]
+        optional: list[tuple[str, list[str]]] = [
+            ("--permission-prompts", ["none"]),
+            ("--setting-sources", ["project"]),
+            ("--no-session-persistence", []),
+            ("--model", [model]),
+        ]
+        if budget and float(budget) > 0:
+            optional.append(("--max-budget-usd", [f"{float(budget):g}"]))
+        for flag, values in optional:
+            if flag in flags:
+                cmd += [flag, *values]
+        cmd += ["--tools", ",".join(SERVICE_TOOLS)]
+        disabled = self._disabled_services()
+        if disabled:
+            cmd += ["--disallowedTools", ",".join(disabled)]
         return cmd
 
     def _spawn(self, task: Task, claude: str) -> None:
@@ -663,7 +1104,7 @@ class Hands:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr,
-                env=self._child_env(folder),
+                env=self._child_env(folder, task.tmpdir),
                 start_new_session=True,
             )
         finally:
@@ -701,7 +1142,10 @@ class Hands:
                 return
             task.status = status
             task.ended = time.time()
-        proc = task.proc
+        self._kill_group(task.proc)
+
+    @staticmethod
+    def _kill_group(proc: Any) -> None:
         if proc is None or proc.poll() is not None:
             return
         try:
@@ -750,9 +1194,23 @@ class Hands:
 
     def _on_event(self, task: Task, event: dict[str, Any]) -> None:
         kind = event.get("type")
+        if kind == "system" and event.get("subtype") == "hook_response":
+            if GUARD_TOKEN in str(event.get("stdout") or event.get("output") or ""):
+                task.guard_ok = True
+            return
         if kind == "system" and event.get("subtype") == "init":
             task.session_id = str(event.get("session_id") or "")
             task.note = "il analyse la demande"
+            if not task.guard_ok:  # our --settings were dropped: no sandbox
+                log.error("Task %s: safety settings not applied, stopping", task.id)
+                task.error = (
+                    "le bac à sable de sécurité n'a pas pu être activé, j'ai "
+                    "tout arrêté avant qu'elle ne commence."
+                )
+                self._stop(task, "failed")
+                self.notifier.announce(
+                    f"La tâche « {task.title} » n'a pas démarré : {task.error}"
+                )
             return
         if kind != "assistant":
             return
@@ -798,6 +1256,11 @@ class Hands:
             return ""
         if name in ("Task", "Agent"):
             return "il a lancé un sous-agent"
+        if name.startswith("mcp__"):
+            server = name.split("__")[1] if name.count("__") >= 2 else name
+            server = re.sub(r"^(claude_ai|plugin)_", "", server)
+            server = server.split("_")[0] if server.startswith("playwright") else server
+            return f"il utilise {server.replace('_', ' ')}"
         return f"il utilise l'outil {name}" if name else ""
 
     @staticmethod
@@ -812,6 +1275,8 @@ class Hands:
     def _finish(self, task: Task, result: dict[str, Any] | None, code: int) -> None:
         if task.timer is not None:
             task.timer.cancel()
+        if task.tmpdir:
+            shutil.rmtree(task.tmpdir, ignore_errors=True)
         cost = result.get("total_cost_usd") if result else None
         if isinstance(cost, (int, float)):
             task.cost_usd = float(cost)
@@ -876,7 +1341,7 @@ class Hands:
             pass
         low = err.lower()
         if "log in" in low or "login" in low or "auth" in low:
-            return "Claude Code n'est pas connecté à ton compte."
+            return "Claude Code n'est pas connecté à votre compte."
         if "sandbox" in low:
             return "le bac à sable de sécurité n'a pas pu démarrer."
         return f"Claude Code s'est arrêté avec une erreur (code {code})."
@@ -885,7 +1350,7 @@ class Hands:
 
     def _spoken_folder(self, task: Task) -> str:
         name = self.workspace.name or "Jarvis"
-        return f"ton dossier {name}, sous-dossier {task.slug.replace('-', ' ')}"
+        return f"votre dossier {name}, sous-dossier {task.slug.replace('-', ' ')}"
 
     def _unpath(self, task: Task, text: str) -> str:
         """Replace spelled-out folder paths by a phrase that reads well."""

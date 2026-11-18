@@ -753,12 +753,21 @@ class Brain:
 
     def _build_static_prompt(self) -> str:
         user = self._user_name()
-        address = (
-            f"- Vouvoie l'utilisateur et appelle-le {user} de temps en temps, "
-            "sans en abuser.\n"
-            if user
-            else "- Vouvoie l'utilisateur.\n"
-        )
+        if user.lower() in {"monsieur", "madame"}:
+            # Butler style: the title is part of nearly every reply.
+            address = (
+                f"- Vouvoie l'utilisateur et appelle-le « {user} », comme un "
+                "majordome, dans presque chaque réponse (au début ou à la fin "
+                f"d'une phrase, par exemple « C'est fait, {user}. »). "
+                "N'utilise jamais son prénom.\n"
+            )
+        elif user:
+            address = (
+                f"- Vouvoie l'utilisateur et appelle-le {user} de temps en temps, "
+                "sans en abuser.\n"
+            )
+        else:
+            address = "- Vouvoie l'utilisateur.\n"
         lang = self.cfg.assistant.language
         prompt = _load_persona().format(
             name=self.cfg.assistant.name,

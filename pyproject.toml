@@ -136,6 +136,8 @@ orb = [
     "sounddevice>=0.5",
     "numpy>=1.24",
     "truststore>=0.9",
+    # Microsoft neural voices (free, online) — `voice.engine = "edge"`.
+    "edge-tts>=7.0",
 ]
 openhands =["openhands-sdk>=1.0; python_version >= '3.12'"]
 # Apple Foundation Models (on-device AFM 3). Needs an Apple Silicon Mac on

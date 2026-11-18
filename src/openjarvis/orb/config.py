@@ -20,7 +20,7 @@ DATA_DIR = Path.home() / ".openjarvis" / "orb"  # models, journal, cache
 class AssistantConfig:
     name: str = "Jarvis"
     language: str = "fr"
-    user_name: str = ""  # how the assistant addresses you; empty = no name
+    user_name: str = "Monsieur"  # how the assistant addresses you
 
 
 @dataclass
@@ -49,11 +49,18 @@ class EarsConfig:
 
 @dataclass
 class VoiceConfig:
-    engine: str = "piper"  # "piper" (neural, local) or "say" (macOS built-in)
+    # "edge" (Microsoft neural voices, online, free), "elevenlabs" (paid),
+    # "piper" (local) or "say" (macOS built-in)
+    engine: str = "edge"
+    edge_voice: str = "fr-FR-RemyMultilingualNeural"
+    pitch: str = "+0Hz"  # edge only, e.g. "-2Hz"
+    elevenlabs_voice: str = ""  # empty = default premade voice
+    elevenlabs_model: str = "eleven_flash_v2_5"
+    online_effect: str = "none"  # voice_fx preset for edge / elevenlabs
     piper_voice: str = "fr_FR-tom-medium"
     say_voice: str = "Thomas"
-    speed: float = 1.0
-    effect: str = "jarvis"  # none, jarvis, jarvis_deep, jarvis_air, helmet
+    speed: float = 1.15
+    effect: str = "jarvis"  # piper/say only: none, jarvis, jarvis_deep, …
 
 
 @dataclass
@@ -81,9 +88,14 @@ class HandsConfig:
     enabled: bool = True
     workspace: str = "~/Jarvis"  # where delegated work happens
     model: str = ""  # Claude Code model alias; empty = Claude Code default
-    confirm: bool = True  # ask out loud before starting a task
+    confirm: bool = False  # True = ask out loud before starting a task
     max_budget_usd: float = 2.0  # per task, when supported by the CLI
     max_parallel: int = 2
+    services_model: str = ""  # model for ask_services; empty = sonnet
+    services_budget_usd: float = 0.5
+    extra_domains: list[str] = field(default_factory=list)  # e.g. "api.x.com"
+    disabled_services: list[str] = field(default_factory=list)  # "Microsoft 365"
+    browser: bool = True  # Playwright browser automation in jobs
 
 
 @dataclass
@@ -104,7 +116,7 @@ DEFAULT_TOML = """\
 [assistant]
 name = "Jarvis"
 language = "fr"
-user_name = ""            # comment il t'appelle (vide = pas de nom)
+user_name = "Monsieur"    # comment il t'appelle
 
 [brain]
 host = "http://127.0.0.1:11434"   # serveur Ollama
@@ -126,11 +138,20 @@ barge_in = true           # dire le mot d'activation pendant qu'il parle l'inter
 barge_in_threshold = 0.75 # plus strict car le micro entend aussi sa voix
 
 [voice]
-engine = "piper"          # "piper" (voix neuronale locale) ou "say" (voix macOS)
+# "edge" (voix Microsoft, en ligne, gratuit), "elevenlabs" (payant),
+# "piper" (local, hors ligne) ou "say" (macOS)
+engine = "edge"
+# voix à écouter : ~/Jarvis/voix-reelles/index.txt
+edge_voice = "fr-FR-RemyMultilingualNeural"
+pitch = "+0Hz"            # edge : hauteur, ex. "-2Hz"
+# clé ElevenLabs : ~/.openjarvis/elevenlabs.key ou $ELEVENLABS_API_KEY
+elevenlabs_voice = ""
+elevenlabs_model = "eleven_flash_v2_5"
+online_effect = "none"    # effet pour edge/elevenlabs (none = voix naturelle)
 piper_voice = "fr_FR-tom-medium"
 say_voice = "Thomas"
-speed = 1.0
-# effets : none, jarvis, jarvis_deep, jarvis_air, helmet
+speed = 1.15              # débit de parole (1.0 = normal)
+# effets piper/say : none, jarvis, jarvis_deep, jarvis_air, helmet
 # (échantillons à écouter : ~/Jarvis/echantillons-voix)
 effect = "jarvis"
 
@@ -149,9 +170,15 @@ web_search = true
 enabled = true
 workspace = "~/Jarvis"    # dossier où il construit
 model = ""                # vide = modèle par défaut de Claude Code
-confirm = true            # demande ton accord avant de lancer une tâche
+confirm = false           # true = demande ton accord avant de lancer une tâche
 max_budget_usd = 2.0      # plafond de coût par tâche
 max_parallel = 2
+# modèle pour agenda/mails/Drive/Notion : vide = sonnet, "haiku" = 20x moins cher
+services_model = ""
+services_budget_usd = 0.5
+extra_domains = []        # domaines réseau en plus, ex. ["api.monservice.com"]
+disabled_services = []    # services à ne pas utiliser, ex. ["Microsoft 365"]
+browser = true            # navigateur automatisé dans les tâches
 """
 
 
