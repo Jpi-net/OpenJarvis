@@ -49,9 +49,10 @@ class EarsConfig:
 
 @dataclass
 class VoiceConfig:
-    # "edge" (Microsoft neural voices, online, free), "elevenlabs" (paid),
-    # "piper" (local) or "say" (macOS built-in)
-    engine: str = "edge"
+    # Local engines: "piper", "say" (macOS built-in).
+    # Online engines (text leaves the Mac): "edge" (Microsoft), "elevenlabs".
+    engine: str = "piper"
+    local_only: bool = True  # refuse online engines even if selected
     edge_voice: str = "fr-FR-RemyMultilingualNeural"
     pitch: str = "+0Hz"  # edge only, e.g. "-2Hz"
     elevenlabs_voice: str = ""  # empty = default premade voice
@@ -140,9 +141,10 @@ barge_in = true           # dire le mot d'activation pendant qu'il parle l'inter
 barge_in_threshold = 0.75 # plus strict car le micro entend aussi sa voix
 
 [voice]
-# "edge" (voix Microsoft, en ligne, gratuit), "elevenlabs" (payant),
-# "piper" (local, hors ligne) ou "say" (macOS)
-engine = "edge"
+# voix locales : "piper", "say" (macOS)
+# voix en ligne (le texte part sur un serveur) : "edge" (Microsoft), "elevenlabs"
+engine = "piper"
+local_only = true         # true = jamais de voix en ligne, même si choisie
 # voix à écouter : ~/Jarvis/voix-reelles/index.txt
 edge_voice = "fr-FR-RemyMultilingualNeural"
 pitch = "+0Hz"            # edge : hauteur, ex. "-2Hz"

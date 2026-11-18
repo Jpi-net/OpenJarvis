@@ -84,6 +84,7 @@ _SILENCE_LEVEL = 0.006
 # piper peaks near full scale, ~3 dB above the online voices: level-match it
 # when it stands in for them, so a fallback sentence does not jump out.
 _FALLBACK_GAIN = 0.7
+_ONLINE_ENGINES = frozenset({"edge", "elevenlabs"})
 
 
 # --------------------------------------------------------------------------
@@ -1033,6 +1034,15 @@ class Voice:
     def __init__(self, cfg: VoiceConfig):
         self.cfg = cfg
         self._engine = (cfg.engine or "piper").strip().lower()
+        if self._engine in _ONLINE_ENGINES and getattr(cfg, "local_only", True):
+            # Privacy guard: the user wants speech synthesis to never leave
+            # the Mac. Online engines need `local_only = false` explicitly.
+            logger.warning(
+                "Voice engine %r sends text to a server and local_only is set; "
+                "using piper instead",
+                self._engine,
+            )
+            self._engine = "piper"
         self._piper: Any = None
         self._syn_config: Any = None
         self._piper_rate = 0

@@ -25,6 +25,7 @@ class Cfg:
     say_voice: str = "Thomas"
     speed: float = 1.15
     effect: str = "jarvis"
+    local_only: bool = False  # these tests exercise the online engines
 
 
 class WavSink:
@@ -553,3 +554,10 @@ def test_close_closes_online_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     v._ensure_loaded()
     v.close()
     assert net.closed
+
+
+def test_local_only_refuses_online_engines() -> None:
+    """With local_only (the default), no text may leave the Mac."""
+    for engine in ("edge", "elevenlabs"):
+        v = V.Voice(Cfg(engine=engine, local_only=True))  # type: ignore[arg-type]
+        assert v._engine == "piper"
