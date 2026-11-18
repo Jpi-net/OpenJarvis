@@ -257,6 +257,42 @@ class UtteranceSegmenter:
 # ---------------------------------------------------------------------------
 
 
+def _after_name(text: str, names: list[str]) -> str | None:
+    """If ``text`` addresses the assistant by name, return what follows the
+    name ("" if nothing); otherwise None. Tolerates Whisper's spellings of
+    "Jarvis" (Jarvie, Jarvisse, J'arvis…) and a leading "hey"/"ok"/"dis"."""
+    import re
+    import unicodedata
+
+    plain = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    plain = plain.lower().replace("'", "")
+    for name in names:
+        stem = re.escape(name[: max(4, len(name) - 2)])  # "jarv" for jarvis
+        m = re.search(rf"\b{stem}\w*", plain)
+        if m is None:
+            continue
+        # Only a wake-up if the name opens the sentence (allow a greeting).
+        head = plain[: m.start()].strip(" ,.!?-")
+        if head and head not in {
+            "hey",
+            "he",
+            "hei",
+            "eh",
+            "ok",
+            "okay",
+            "dis",
+            "salut",
+            "bonjour",
+            "allo",
+        }:
+            continue
+        # Map the end of the match back onto the original text.
+        words_before = len(plain[: m.end()].split())
+        rest = " ".join(text.split()[words_before:]).strip(" ,.!?-")
+        return rest
+    return None
+
+
 class Ears:
     """Wake word + utterance recording + faster-whisper transcription."""
 
@@ -271,6 +307,7 @@ class Ears:
         # queue that only the interrupt detector reads.
         self._barge = threading.Event()
         self._barge_queue: queue.Queue = queue.Queue(maxsize=int(5 / CHUNK_SECONDS))
+        self.pending_text = ""  # words said right after the name, if any
         self._wake: WakeWordDetector | None = None
         self._vad: SpeechProbability | None = None
         self._whisper = None
@@ -465,19 +502,72 @@ class Ears:
         stop: threading.Event,
         level_cb: Callable[[float], None] | None = None,
     ) -> bool:
+        """Block until woken (True) or stopped (False).
+
+        Two triggers: the openWakeWord model ("hey jarvis"), and — when
+        ``wake_by_name`` is on — any short burst of speech whose local Whisper
+        transcript contains the assistant's name ("Jarvis, quelle heure…").
+        In the latter case the words after the name are kept in
+        ``self.pending_text`` so the app can answer without asking again.
+        """
+        import numpy as np
+
         self._load_wake()
         self._ensure_stream()
-        assert self._wake is not None
+        assert self._wake is not None and self._vad is not None
         self._wake.reset()
+        self._vad.reset()
+        self.pending_text = ""
+        by_name = bool(getattr(self.cfg, "wake_by_name", True))
+        names = [
+            n.strip().lower()
+            for n in str(getattr(self.cfg, "wake_names", "jarvis")).split(",")
+            if n.strip()
+        ]
+        pre_roll: deque = deque(maxlen=4)  # ~320 ms before speech starts
+        burst: list = []
+        silence = 0
+        best = 0.0
+        max_chunks = int(10.0 / CHUNK_SECONDS)
         while True:
             chunk = self._next_chunk(stop)
             if chunk is None:
                 return False
             if level_cb is not None:
                 level_cb(chunk_level(chunk))
-            if self._wake.process(chunk):
-                logger.info("Wake word detected")
+            score = self._wake.score(chunk)
+            best = max(best, score)
+            if score >= self._wake.threshold:
+                logger.info("Wake word detected (%.2f)", score)
+                self._wake.reset()
                 return True
+            speaking = self._vad(chunk) >= 0.5
+            if speaking or burst:
+                burst.append(chunk)
+                silence = 0 if speaking else silence + 1
+            else:
+                pre_roll.append(chunk)
+            # End of a speech burst: 0.5 s of silence, or too long.
+            if burst and (silence >= 6 or len(burst) >= max_chunks):
+                voiced = len(burst) - silence
+                logger.info(
+                    "Heard %.1fs of speech, best wake score %.2f (threshold %.2f)",
+                    voiced * CHUNK_SECONDS,
+                    best,
+                    self._wake.threshold,
+                )
+                audio = np.concatenate([*pre_roll, *burst])
+                burst, silence, best = [], 0, 0.0
+                pre_roll.clear()
+                if by_name and voiced >= 3:  # >= 240 ms of speech
+                    text = self.transcribe(audio.astype(np.float32) / 32768.0)
+                    rest = _after_name(text, names)
+                    if rest is not None:
+                        logger.info("Woken by name: %r", text)
+                        self.pending_text = rest
+                        self._wake.reset()
+                        self._vad.reset()
+                        return True
 
     def listen_for_interrupt(self, stop: threading.Event, threshold: float) -> bool:
         """While muted (assistant speaking), watch for the wake word.

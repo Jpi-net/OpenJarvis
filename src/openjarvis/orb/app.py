@@ -222,6 +222,12 @@ class OrbApp:
                 start_timeout = follow_up  # let the user react to the news
             else:
                 start_timeout = max(follow_up, 5.0)
+                pending = getattr(self.ears, "pending_text", "")
+                if pending:  # "Jarvis, quelle heure est-il ?" in one breath
+                    self.ears.pending_text = ""
+                    self._answer(pending)
+                    self._announce_pending()
+                    start_timeout = follow_up
             # Conversation: keep listening without the wake word while the
             # user keeps talking within the follow-up window.
             while not self.stop.is_set():

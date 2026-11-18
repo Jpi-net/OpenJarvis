@@ -35,7 +35,9 @@ class BrainConfig:
 @dataclass
 class EarsConfig:
     wake_word: str = "hey_jarvis"  # openWakeWord model name
-    wake_threshold: float = 0.5
+    wake_threshold: float = 0.4
+    wake_by_name: bool = True  # also wake on "Jarvis…" via local Whisper
+    wake_names: str = "jarvis"  # comma-separated names that wake it
     # "auto" = mlx-whisper on the Apple GPU when available, else faster-whisper
     stt_engine: str = "auto"
     stt_model: str = "large-v3-turbo"  # tiny, base, small, medium, large-v3-turbo
@@ -143,7 +145,9 @@ keep_alive = "30m"        # garde le modèle chargé en mémoire
 
 [ears]
 wake_word = "hey_jarvis"  # mot d'activation (openWakeWord)
-wake_threshold = 0.5      # plus haut = moins de faux déclenchements
+wake_threshold = 0.4      # plus haut = moins de faux déclenchements
+wake_by_name = true       # se réveille aussi quand on dit « Jarvis, … » (Whisper local)
+wake_names = "jarvis"     # noms qui le réveillent, séparés par des virgules
 stt_engine = "auto"       # auto (GPU Apple si dispo), mlx, faster-whisper
 stt_model = "large-v3-turbo" # tiny, base, small, medium, large-v3-turbo
 silence_seconds = 0.8     # fin de phrase après ce silence
