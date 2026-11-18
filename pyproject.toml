@@ -123,7 +123,21 @@ voice = [
     "sounddevice>=0.5",  # play_wav / record_until_silence in speech/voice_io.py
     "numpy>=1.24",
 ]
-openhands = ["openhands-sdk>=1.0; python_version >= '3.12'"]
+# Voice-only orb interface (`jarvis orb`): floating window, wake word,
+# local French TTS. Speech-to-text reuses faster-whisper from `desktop`.
+orb = [
+    "pywebview>=5.0",
+    "openwakeword>=0.6",
+    "piper-tts>=1.2",
+    "faster-whisper>=1.0",
+    "av>=11,<19",
+    # Whisper on the Apple GPU: ~6x faster than faster-whisper on CPU.
+    "mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sounddevice>=0.5",
+    "numpy>=1.24",
+    "truststore>=0.9",
+]
+openhands =["openhands-sdk>=1.0; python_version >= '3.12'"]
 # Apple Foundation Models (on-device AFM 3). Needs an Apple Silicon Mac on
 # macOS 26+ with Apple Intelligence enabled. The SDK compiles Swift bindings
 # at install time, so a full Xcode is required -- Command Line Tools alone

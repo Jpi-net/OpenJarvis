@@ -1,0 +1,275 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent !important; overflow: hidden;
+    -webkit-user-select: none; user-select: none; cursor: default;
+  }
+  canvas { display: block; width: 100%; height: 100%; background: transparent; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+  // Replaced by ui.py with a validated #rrggbb colour.
+  var HEX = "__ORB_COLOR__";
+  if (!/^#[0-9a-fA-F]{6}$/.test(HEX)) HEX = "#4fc3ff";
+  var BASE = [parseInt(HEX.substr(1, 2), 16), parseInt(HEX.substr(3, 2), 16), parseInt(HEX.substr(5, 2), 16)];
+  function mix(c, t) { // t: 0 = colour, 1 = white
+    return [Math.round(c[0] + (255 - c[0]) * t), Math.round(c[1] + (255 - c[1]) * t), Math.round(c[2] + (255 - c[2]) * t)];
+  }
+  function rgba(c, a) { return "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + (a < 0 ? 0 : a > 1 ? 1 : a).toFixed(3) + ")"; }
+  var C0 = BASE, C1 = mix(BASE, 0.35), C2 = mix(BASE, 0.7), CW = mix(BASE, 0.92);
+  // A deeper, slightly hue-shifted companion colour for depth.
+  var CK = [Math.round(BASE[0] * 0.06), Math.round(BASE[1] * 0.08), Math.round(BASE[2] * 0.12)];
+  var CD = [Math.round(BASE[2] * 0.55), Math.round(BASE[0] * 0.35), Math.round(BASE[1] * 0.9)];
+
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var W = 0, H = 0, DPR = 1;
+  function resize() {
+    DPR = window.devicePixelRatio || 1;
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---- state machine -----------------------------------------------------
+  var PRESETS = {
+    //          glow  scale speed ringAmp swirl gain  breath parts core
+    idle:      [0.58, 0.90, 0.35, 0.035,  0.15, 0.25, 1.0,   0.35, 0.65],
+    listening: [0.85, 1.04, 0.80, 0.050,  0.35, 0.70, 0.3,   0.70, 0.85],
+    thinking:  [0.80, 0.96, 2.60, 0.075,  2.40, 0.20, 0.2,   1.00, 0.80],
+    speaking:  [0.92, 1.00, 1.10, 0.045,  0.55, 1.00, 0.2,   0.75, 0.95]
+  };
+  var KEYS = ["glow", "scale", "speed", "ringAmp", "swirl", "gain", "breath", "parts", "core"];
+  var cur = {}, tgt = {};
+  KEYS.forEach(function (k, i) { cur[k] = PRESETS.idle[i]; tgt[k] = PRESETS.idle[i]; });
+  cur.glow = 0; // fade in on start
+  var thinkMix = 0, thinkTgt = 0;
+
+  var rawLevel = 0, level = 0;
+
+  window.orb = {
+    setState: function (s) {
+      var p = PRESETS[s]; if (!p) return;
+      KEYS.forEach(function (k, i) { tgt[k] = p[i]; });
+      thinkTgt = s === "thinking" ? 1 : 0;
+    },
+    setLevel: function (v) {
+      v = +v; if (!(v >= 0)) v = 0; if (v > 1) v = 1;
+      rawLevel = v;
+    }
+  };
+
+  // ---- particles -----------------------------------------------------------
+  var N = 70, parts = [];
+  for (var i = 0; i < N; i++) {
+    parts.push({
+      a: Math.random() * Math.PI * 2,          // orbit angle
+      inc: (Math.random() - 0.5) * 2.4,        // orbit tilt
+      node: Math.random() * Math.PI * 2,       // orbit node rotation
+      r: 1.15 + Math.random() * 0.55,          // orbit radius (x R)
+      w: 0.4 + Math.random() * 0.9,            // angular speed
+      s: 0.5 + Math.random() * 1.1,            // size
+      tw: Math.random() * Math.PI * 2          // twinkle phase
+    });
+  }
+
+  // Ring definitions: harmonics for a smooth pseudo-noise outline.
+  var RINGS = [];
+  for (var j = 0; j < 6; j++) {
+    RINGS.push({
+      k: [2 + j % 3, 3 + (j * 2) % 4, 5 + j % 2],
+      p: [Math.random() * 6.28, Math.random() * 6.28, Math.random() * 6.28],
+      v: [0.6 + Math.random() * 0.6, -0.4 - Math.random() * 0.7, 0.9 + Math.random() * 0.8],
+      rr: 0.98 + j * 0.035,
+      dir: j % 2 ? 1 : -1,
+      col: j % 3 === 0 ? C2 : (j % 3 === 1 ? C1 : C0)
+    });
+  }
+
+  var phase = 0, rot = 0, last = performance.now(), breathT = 0;
+  var SEG = 96;
+
+  function frame(now) {
+    // Moving between monitors changes the pixel ratio without a resize event.
+    if ((window.devicePixelRatio || 1) !== DPR || window.innerWidth !== W || window.innerHeight !== H) resize();
+    var dt = Math.min(0.05, Math.max(0.001, (now - last) / 1000));
+    last = now;
+
+    // Smooth parameters (no snapping).
+    var e = 1 - Math.exp(-dt * 3.2);
+    KEYS.forEach(function (k) { cur[k] += (tgt[k] - cur[k]) * e; });
+    thinkMix += (thinkTgt - thinkMix) * (1 - Math.exp(-dt * 2.5));
+    // Level: fast attack, slow release.
+    var le = rawLevel > level ? 1 - Math.exp(-dt * 28) : 1 - Math.exp(-dt * 5);
+    level += (rawLevel - level) * le;
+    var L = level * cur.gain;
+
+    phase += dt * cur.speed;
+    rot += dt * cur.swirl;
+    breathT += dt;
+
+    var cx = W / 2, cy = H / 2;
+    var breath = 1 + 0.035 * Math.sin(breathT * 1.25) * cur.breath;
+    var R = Math.min(W, H) * 0.215 * cur.scale * breath * (1 + 0.16 * L);
+    var glow = Math.min(1.2, cur.glow * (1 + 0.45 * L) * (0.92 + 0.08 * Math.sin(breathT * 1.25) * cur.breath));
+    var half = Math.min(W, H) / 2;
+
+    ctx.globalCompositeOperation = "source-over";
+    ctx.clearRect(0, 0, W, H);
+    // 0. Dark glass backing so the orb keeps its body on bright backgrounds.
+    var dk = Math.max(0.35, Math.min(1, cur.glow + 0.25));
+    var g0 = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 1.22);
+    g0.addColorStop(0, rgba(CK, 0.80 * dk));
+    g0.addColorStop(0.78, rgba(CK, 0.70 * dk));
+    g0.addColorStop(0.9, rgba(CK, 0.30 * dk));
+    g0.addColorStop(1, rgba(CK, 0));
+    ctx.fillStyle = g0;
+    ctx.beginPath(); ctx.arc(cx, cy, R * 1.22, 0, Math.PI * 2); ctx.fill();
+
+    ctx.globalCompositeOperation = "lighter";
+
+    // 1. Outer halo (fades to 0 before the window edge).
+    var g = ctx.createRadialGradient(cx, cy, R * 0.5, cx, cy, half * 0.98);
+    g.addColorStop(0, rgba(C0, 0.38 * glow));
+    g.addColorStop(0.25, rgba(C0, 0.16 * glow));
+    g.addColorStop(0.55, rgba(CD, 0.06 * glow));
+    g.addColorStop(1, rgba(C0, 0));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // 2. Sphere body.
+    g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 1.08);
+    g.addColorStop(0, rgba(C1, 0.55 * glow));
+    g.addColorStop(0.55, rgba(C0, 0.32 * glow));
+    g.addColorStop(0.85, rgba(C0, 0.22 * glow));
+    g.addColorStop(0.95, rgba(C1, 0.30 * glow));
+    g.addColorStop(1, rgba(C0, 0));
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(cx, cy, R * 1.08, 0, Math.PI * 2); ctx.fill();
+
+    // 3. Inner plasma: drifting blobs clipped to the sphere.
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, R * 0.98, 0, Math.PI * 2); ctx.clip();
+    for (var b = 0; b < 4; b++) {
+      var ba = phase * (0.7 + b * 0.23) * (b % 2 ? -1 : 1) + b * 1.7 + rot * (0.5 + thinkMix);
+      var br = R * (0.32 + 0.18 * Math.sin(phase * 0.9 + b * 2.1));
+      var bx = cx + Math.cos(ba) * br, by = cy + Math.sin(ba * 1.3) * br * 0.8;
+      var bs = R * (0.55 + 0.15 * Math.sin(phase * 1.7 + b));
+      g = ctx.createRadialGradient(bx, by, 0, bx, by, bs);
+      var bc = b % 2 ? C2 : CD;
+      g.addColorStop(0, rgba(bc, (0.20 + 0.25 * L) * glow));
+      g.addColorStop(1, rgba(bc, 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(bx - bs, by - bs, bs * 2, bs * 2);
+    }
+    ctx.restore();
+
+    // 4. Flowing noise rings around the rim.
+    var amp = cur.ringAmp + 0.16 * L;
+    ctx.lineJoin = "round";
+    for (var ri = 0; ri < RINGS.length; ri++) {
+      var ring = RINGS[ri];
+      var rr = R * ring.rr;
+      var off = rot * ring.dir * (0.6 + ri * 0.15);
+      ctx.beginPath();
+      for (var s = 0; s <= SEG; s++) {
+        var th = (s / SEG) * Math.PI * 2;
+        var n = Math.sin(ring.k[0] * th + ring.p[0] + phase * ring.v[0]) * 0.55 +
+                Math.sin(ring.k[1] * th + ring.p[1] + phase * ring.v[1]) * 0.30 +
+                Math.sin(ring.k[2] * th + ring.p[2] + phase * ring.v[2]) * 0.15;
+        var r = rr * (1 + amp * n);
+        var x = cx + Math.cos(th + off) * r, y = cy + Math.sin(th + off) * r;
+        if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.strokeStyle = rgba(ring.col, (0.10 + 0.05 * (ri % 2)) * glow * 1.4);
+      ctx.lineWidth = 3.2;
+      ctx.stroke();
+      ctx.strokeStyle = rgba(ring.col, (0.30 + 0.15 * L) * glow);
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    // 5. Thinking: rotating arcs of energy.
+    if (thinkMix > 0.01) {
+      for (var a = 0; a < 3; a++) {
+        var start = rot * (1.3 + a * 0.4) * (a % 2 ? -1 : 1) + a * 2.09;
+        var len = 0.9 + 0.5 * Math.sin(phase * 0.8 + a);
+        var ar = R * (1.18 + a * 0.09);
+        ctx.beginPath();
+        ctx.arc(cx, cy, ar, start, start + len);
+        ctx.strokeStyle = rgba(a === 1 ? C2 : C1, 0.55 * thinkMix * glow);
+        ctx.lineWidth = 1.6;
+        ctx.lineCap = "round";
+        ctx.stroke();
+        ctx.strokeStyle = rgba(C0, 0.18 * thinkMix * glow);
+        ctx.lineWidth = 5;
+        ctx.stroke();
+      }
+    }
+
+    // 6. Particles orbiting in 3D.
+    var pAlpha = cur.parts * glow;
+    if (pAlpha > 0.01) {
+      for (var pi = 0; pi < N; pi++) {
+        var p = parts[pi];
+        p.a += dt * p.w * (cur.speed * 0.8 + cur.swirl * 0.6);
+        var pr = R * (p.r * (1 - 0.18 * thinkMix) + 0.35 * L * (0.5 + 0.5 * Math.sin(p.tw + phase * 3)));
+        var ox = Math.cos(p.a) * pr, oy = Math.sin(p.a) * pr;
+        var oz = oy * Math.sin(p.inc); oy = oy * Math.cos(p.inc);
+        var cn = Math.cos(p.node + rot * 0.2), sn = Math.sin(p.node + rot * 0.2);
+        var px = ox * cn - oy * sn, py = ox * sn + oy * cn;
+        var depth = 0.5 + 0.5 * (oz / pr); // 0 back .. 1 front
+        if (depth < 0.45 && px * px + py * py < R * R) continue; // hidden behind sphere
+        var tw = 0.6 + 0.4 * Math.sin(p.tw + breathT * 2.2 * (1 + p.w));
+        var al = pAlpha * tw * (0.25 + 0.75 * depth);
+        var sz = p.s * (0.6 + 0.8 * depth);
+        var qx = cx + px, qy = cy + py;
+        if (Math.abs(px) > half - 4 || Math.abs(py) > half - 4) continue;
+        ctx.fillStyle = rgba(C0, al * 0.25);
+        ctx.beginPath(); ctx.arc(qx, qy, sz * 3, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = rgba(CW, al);
+        ctx.beginPath(); ctx.arc(qx, qy, sz, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    // 7. Hot core + specular highlight.
+    var cr = R * (0.42 + 0.25 * L);
+    g = ctx.createRadialGradient(cx, cy, 0, cx, cy, cr);
+    g.addColorStop(0, rgba(CW, (0.55 + 0.35 * L) * cur.core * glow));
+    g.addColorStop(0.4, rgba(C2, 0.22 * cur.core * glow));
+    g.addColorStop(1, rgba(C0, 0));
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, Math.PI * 2); ctx.fill();
+
+    var hx = cx - R * 0.38, hy = cy - R * 0.42, hr = R * 0.45;
+    g = ctx.createRadialGradient(hx, hy, 0, hx, hy, hr);
+    g.addColorStop(0, rgba(CW, 0.20 * glow));
+    g.addColorStop(1, rgba(CW, 0));
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(hx, hy, hr, 0, Math.PI * 2); ctx.fill();
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // Nothing to click, select or open.
+  ["contextmenu", "dblclick", "selectstart", "dragstart"].forEach(function (ev) {
+    window.addEventListener(ev, function (e) { e.preventDefault(); });
+  });
+})();
+</script>
+</body>
+</html>
