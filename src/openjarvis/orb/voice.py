@@ -9,6 +9,12 @@ Engines:
 - ``piper`` (default): local neural TTS. The voice is downloaded once from
   Hugging Face (``rhasspy/piper-voices``) into ``DATA_DIR/piper/``.
 - ``say``: macOS built-in voices. Also used automatically when piper fails.
+- ``chatterbox``: Resemble AI's Chatterbox multilingual model (MIT), on the
+  Apple GPU through MLX, cloning the timbre of a ~10 s reference clip. It
+  runs in a separate local worker process (its own venv, set up by
+  ``python -m openjarvis.orb.voice_setup``) that keeps the model loaded and
+  talks to the orb over stdin/stdout pipes only: no port, no network, the
+  weights are read from the local cache. Piper takes over if it fails.
 - ``edge``: Microsoft Edge "Read aloud" neural voices (``edge-tts``; online,
   free, no key). ``cfg.edge_voice`` is a short name such as
   ``fr-FR-RemyMultilingualNeural``. The text is sent to Microsoft.
@@ -34,11 +40,14 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import math
 import os
 import queue
 import re
+import select
+import struct
 import subprocess
 import tempfile
 import threading
@@ -85,6 +94,18 @@ _SILENCE_LEVEL = 0.006
 # when it stands in for them, so a fallback sentence does not jump out.
 _FALLBACK_GAIN = 0.7
 _ONLINE_ENGINES = frozenset({"edge", "elevenlabs"})
+
+CHATTERBOX_SAMPLE_RATE = 24000
+CHATTERBOX_VENV = DATA_DIR / "chatterbox-venv"
+CHATTERBOX_VOICES = DATA_DIR / "voices"
+CHATTERBOX_USER_REFERENCE = CHATTERBOX_VOICES / "reference.wav"
+CHATTERBOX_DEFAULT_REFERENCE = "grave"
+CHATTERBOX_MODEL = "mlx-community/chatterbox-multilingual-v3"
+CHATTERBOX_LOG = DATA_DIR / "chatterbox-worker.log"
+_CHATTERBOX_WORKER = Path(__file__).with_name("chatterbox_worker.py")
+_CHATTERBOX_START_TIMEOUT_S = 240.0  # first load of 2.7 GB of weights
+_CHATTERBOX_SAY_TIMEOUT_S = 30.0
+_CHATTERBOX_RETRY_AFTER_S = 30.0
 
 
 # --------------------------------------------------------------------------
@@ -1030,6 +1051,191 @@ class ElevenLabsEngine:
         self._client.close()
 
 
+# --------------------------------------------------------------------------
+# Chatterbox (local worker process)
+# --------------------------------------------------------------------------
+
+
+class ChatterboxError(RuntimeError):
+    """The Chatterbox worker is missing, died, or a request failed."""
+
+
+def chatterbox_command(venv: Path | None = None) -> list[str]:
+    """How to start the worker: its venv's python, isolated, on the script."""
+    python = (venv or CHATTERBOX_VENV) / "bin" / "python"
+    if not python.exists():
+        raise ChatterboxError(
+            f"Chatterbox is not installed ({python} missing): "
+            "run `python -m openjarvis.orb.voice_setup`"
+        )
+    return [str(python), "-I", str(_CHATTERBOX_WORKER)]
+
+
+def resolve_chatterbox_reference(spec: str) -> Path:
+    """Reference clip for ``chatterbox_reference``.
+
+    Empty: ``voices/reference.wav`` (the user's own clip) if present, else
+    the default built voice. A bare name (``grave``) is a clip of
+    ``~/.openjarvis/orb/voices/``; anything else is a path.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        if CHATTERBOX_USER_REFERENCE.exists():
+            return CHATTERBOX_USER_REFERENCE
+        spec = CHATTERBOX_DEFAULT_REFERENCE
+    if "/" not in spec and not spec.startswith("~"):
+        name = spec[:-4] if spec.lower().endswith(".wav") else spec
+        return CHATTERBOX_VOICES / f"{name}.wav"
+    return Path(spec).expanduser()
+
+
+class ChatterboxWorker:
+    """Client of ``chatterbox_worker.py``: one local process, pipes only.
+
+    Frames are a 4-byte big-endian length + a JSON header, optionally
+    followed by ``nbytes`` of float32 PCM (see the worker's docstring).
+    Requests are serialized; every read has a deadline, so a stuck worker
+    is killed instead of blocking the voice forever.
+    """
+
+    def __init__(
+        self,
+        command: list[str],
+        log_path: Path | None = CHATTERBOX_LOG,
+        popen: Callable[..., Any] = subprocess.Popen,
+    ) -> None:
+        self._command = command
+        self._log_path = log_path
+        self._popen = popen
+        self._proc: Any = None
+        self._lock = threading.Lock()
+        self.sample_rate = CHATTERBOX_SAMPLE_RATE
+
+    @property
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(
+        self,
+        load: dict[str, Any],
+        voice: dict[str, Any],
+        timeout: float = _CHATTERBOX_START_TIMEOUT_S,
+    ) -> dict[str, Any]:
+        """Spawn the worker, load the model and the voice."""
+        env = {
+            **os.environ,
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_HUB_DISABLE_TELEMETRY": "1",
+        }
+        stderr: Any = subprocess.DEVNULL
+        if self._log_path is not None:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr = open(self._log_path, "ab")  # noqa: SIM115 - owned by the child
+        try:
+            self._proc = self._popen(
+                self._command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                env=env,
+                cwd=str(DATA_DIR) if DATA_DIR.exists() else None,
+            )
+        finally:
+            if stderr is not subprocess.DEVNULL:
+                stderr.close()
+        try:
+            info, _ = self.request({"op": "load", **load}, timeout)
+            voice_info, _ = self.request({"op": "voice", **voice}, timeout)
+        except Exception:
+            self.close()
+            raise
+        return {**info, **voice_info}
+
+    def say(
+        self,
+        text: str,
+        params: dict[str, Any],
+        timeout: float = _CHATTERBOX_SAY_TIMEOUT_S,
+    ) -> np.ndarray:
+        import numpy as np
+
+        header, pcm = self.request({"op": "say", "text": text, **params}, timeout)
+        self.sample_rate = int(header.get("sample_rate") or CHATTERBOX_SAMPLE_RATE)
+        if not pcm:
+            return np.zeros(0, dtype=np.float32)
+        return np.frombuffer(pcm, dtype="<f4").astype(np.float32)
+
+    def request(
+        self, req: dict[str, Any], timeout: float
+    ) -> tuple[dict[str, Any], bytes]:
+        with self._lock:
+            if not self.alive:
+                raise ChatterboxError("Chatterbox worker is not running")
+            deadline = time.monotonic() + timeout
+            try:
+                body = json.dumps(req).encode("utf-8")
+                self._proc.stdin.write(struct.pack(">I", len(body)) + body)
+                self._proc.stdin.flush()
+                (size,) = struct.unpack(">I", self._read(4, deadline))
+                header = json.loads(self._read(size, deadline).decode("utf-8"))
+                nbytes = int(header.get("nbytes") or 0)
+                pcm = self._read(nbytes, deadline) if nbytes else b""
+            except ChatterboxError:
+                self._kill()
+                raise
+            except (OSError, ValueError) as exc:
+                self._kill()
+                raise ChatterboxError(f"Chatterbox worker failed: {exc}") from exc
+        if not header.get("ok"):
+            raise ChatterboxError(str(header.get("error") or "request failed"))
+        return header, pcm
+
+    def _read(self, n: int, deadline: float) -> bytes:
+        out = self._proc.stdout
+        fd = out.fileno()
+        chunks: list[bytes] = []
+        got = 0
+        while got < n:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise ChatterboxError("Chatterbox worker timed out")
+            ready, _, _ = select.select([fd], [], [], min(left, 0.5))
+            if not ready:
+                continue
+            data = os.read(fd, min(n - got, 1 << 20))
+            if not data:
+                raise ChatterboxError("Chatterbox worker exited")
+            chunks.append(data)
+            got += len(data)
+        return b"".join(chunks)
+
+    def _kill(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.kill()
+            proc.wait(timeout=2.0)
+        except Exception:
+            logger.debug("Killing the Chatterbox worker failed", exc_info=True)
+
+    def close(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                body = json.dumps({"op": "quit"}).encode("utf-8")
+                proc.stdin.write(struct.pack(">I", len(body)) + body)
+                proc.stdin.flush()
+                proc.stdin.close()
+                proc.wait(timeout=2.0)
+        except Exception:
+            logger.debug("Chatterbox worker did not quit cleanly", exc_info=True)
+        self._kill()
+
+
 class Voice:
     def __init__(self, cfg: VoiceConfig):
         self.cfg = cfg
@@ -1057,6 +1263,10 @@ class Voice:
         self._net: _NetEngine | None = None
         self._net_down_until = 0.0
         self._fallback_thread: threading.Thread | None = None
+        self._cbx: ChatterboxWorker | None = None
+        self._cbx_retry_at = 0.0
+        self._cbx_backoff = _CHATTERBOX_RETRY_AFTER_S
+        self._cbx_restarting = False
 
     # -- loading -----------------------------------------------------------
 
@@ -1090,6 +1300,15 @@ class Voice:
                         exc,
                     )
                     self._engine = "piper"
+            if self._engine == "chatterbox":
+                try:
+                    self._load_chatterbox()
+                    self._sample_rate = CHATTERBOX_SAMPLE_RATE
+                except Exception as exc:
+                    logger.warning(
+                        "Chatterbox voice unavailable (%s); falling back to piper", exc
+                    )
+                    self._engine = "piper"
             if self._engine == "piper":
                 try:
                     self._load_piper()
@@ -1097,7 +1316,7 @@ class Voice:
                 except Exception:
                     logger.exception("Piper unavailable, falling back to macOS 'say'")
                     self._engine = "say"
-            if self._engine not in ("piper", *_NET_ENGINES):
+            if self._engine not in ("piper", "chatterbox", *_NET_ENGINES):
                 if self._engine != "say":
                     logger.warning("Unknown voice engine %r; using 'say'", self._engine)
                 self._engine = "say"
@@ -1123,6 +1342,8 @@ class Voice:
     def _effect_name(self) -> str:
         if self._engine in _NET_ENGINES:
             return str(getattr(self.cfg, "online_effect", "none") or "none")
+        if self._engine == "chatterbox":
+            return str(getattr(self.cfg, "chatterbox_effect", "none") or "none")
         return self.cfg.effect
 
     def _load_fx(self) -> None:
@@ -1169,6 +1390,86 @@ class Voice:
             self._piper_rate,
         )
 
+    # -- chatterbox ----------------------------------------------------------
+
+    def _chatterbox_params(self) -> dict[str, Any]:
+        cfg = self.cfg
+        return {
+            "lang": str(getattr(cfg, "chatterbox_language", "fr") or "fr"),
+            "exaggeration": float(getattr(cfg, "chatterbox_exaggeration", 0.4)),
+            "cfg_weight": float(getattr(cfg, "chatterbox_cfg_weight", 0.5)),
+            "temperature": float(getattr(cfg, "chatterbox_temperature", 0.8)),
+            "speed": max(0.5, min(2.0, float(getattr(cfg, "chatterbox_speed", 1.0)))),
+        }
+
+    def _load_chatterbox(self) -> None:
+        cfg = self.cfg
+        reference = resolve_chatterbox_reference(
+            str(getattr(cfg, "chatterbox_reference", "") or "")
+        )
+        if not reference.is_file():
+            raise ChatterboxError(
+                f"reference clip {reference} missing: "
+                "run `python -m openjarvis.orb.voice_setup`"
+            )
+        worker = ChatterboxWorker(chatterbox_command())
+        t0 = time.perf_counter()
+        info = worker.start(
+            {
+                "model": str(getattr(cfg, "chatterbox_model", "") or CHATTERBOX_MODEL),
+                "quantize": int(getattr(cfg, "chatterbox_quantize", 8)),
+                "flow_steps": int(getattr(cfg, "chatterbox_flow_steps", 4)),
+            },
+            {
+                "reference": str(reference),
+                "exaggeration": self._chatterbox_params()["exaggeration"],
+            },
+        )
+        self._cbx = worker
+        logger.info(
+            "Chatterbox voice %s ready in %.1fs (model %.1fs)",
+            reference.name,
+            time.perf_counter() - t0,
+            float(info.get("load_s", 0.0)),
+        )
+
+    def _restart_chatterbox_async(self) -> None:
+        now = time.monotonic()
+        if self._cbx_restarting or now < self._cbx_retry_at:
+            return
+        self._cbx_restarting = True
+        self._cbx_retry_at = now + self._cbx_backoff
+
+        def run() -> None:
+            try:
+                self._load_chatterbox()
+                self._cbx_backoff = _CHATTERBOX_RETRY_AFTER_S
+            except Exception as exc:
+                # Each attempt reloads the model: back off up to 10 minutes.
+                self._cbx_backoff = min(600.0, self._cbx_backoff * 2)
+                logger.warning("Chatterbox restart failed (%s)", exc)
+            finally:
+                self._cbx_restarting = False
+
+        threading.Thread(target=run, name="orb-voice-cbx", daemon=True).start()
+
+    def _chatterbox_audio(self, text: str) -> np.ndarray | None:
+        """One sentence from the worker, or None (the caller falls back)."""
+        worker = self._cbx
+        if worker is None or not worker.alive:
+            self._cbx = None
+            self._restart_chatterbox_async()
+            return None
+        try:
+            audio = worker.say(text, self._chatterbox_params())
+        except ChatterboxError as exc:
+            logger.warning("Chatterbox failed (%s); piper takes over", exc)
+            if not worker.alive:
+                self._cbx = None
+                self._restart_chatterbox_async()
+            return None
+        return _resample(audio, worker.sample_rate, self._sample_rate)
+
     def _load_fallback_async(self) -> None:
         """Online engine: load piper in the background, ready if the network fails."""
         if self._piper is not None or self._fallback_thread is not None:
@@ -1189,6 +1490,8 @@ class Voice:
         """Load (and download if needed) the voice; prime synthesis and audio."""
         self._ensure_loaded()
         t0 = time.perf_counter()
+        if self._engine == "chatterbox":
+            self._load_fallback_async()
         if self._net is not None:
             self._load_fallback_async()
             try:
@@ -1272,7 +1575,13 @@ class Voice:
         yield from self._job_audio(text, self._start_job(text), lambda: False)
 
     def _synthesize_local(self, text: str) -> Iterable[np.ndarray]:
-        """piper (resampled to the output rate if needed), else ``say``."""
+        """chatterbox, else piper (resampled to the output rate), else ``say``."""
+        if self._engine == "chatterbox":
+            audio = self._chatterbox_audio(text)
+            if audio is not None:
+                yield audio
+                return
+        standing_in = self._net is not None or self._engine == "chatterbox"
         if self._piper is not None:
             said = False
             try:
@@ -1281,7 +1590,7 @@ class Voice:
                     audio = _resample(
                         chunk.audio_float_array, self._piper_rate, self._sample_rate
                     )
-                    yield audio * _FALLBACK_GAIN if self._net is not None else audio
+                    yield audio * _FALLBACK_GAIN if standing_in else audio
                 return
             except Exception:
                 logger.exception("Piper synthesis failed for %r", text)
@@ -1334,12 +1643,15 @@ class Voice:
         return self._output
 
     def close(self) -> None:
-        """Release the audio output and the online engine (at shutdown)."""
+        """Release the audio output and the engines (at shutdown)."""
         if self._output is not None:
             self._output.close()
         net, self._net = self._net, None
         if net is not None:
             net.close()
+        cbx, self._cbx = self._cbx, None
+        if cbx is not None:
+            cbx.close()
 
     # -- public API ----------------------------------------------------------
 

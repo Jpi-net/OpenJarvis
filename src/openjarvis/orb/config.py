@@ -49,15 +49,28 @@ class EarsConfig:
 
 @dataclass
 class VoiceConfig:
-    # Local engines: "piper", "say" (macOS built-in).
+    # Local engines: "chatterbox" (natural, cloned voice), "piper", "say".
     # Online engines (text leaves the Mac): "edge" (Microsoft), "elevenlabs".
-    engine: str = "piper"
+    engine: str = "chatterbox"
     local_only: bool = True  # refuse online engines even if selected
     edge_voice: str = "fr-FR-RemyMultilingualNeural"
     pitch: str = "+0Hz"  # edge only, e.g. "-2Hz"
     elevenlabs_voice: str = ""  # empty = default premade voice
     elevenlabs_model: str = "eleven_flash_v2_5"
     online_effect: str = "none"  # voice_fx preset for edge / elevenlabs
+    # Chatterbox (local, MLX on the Apple GPU). Reference voice: "" uses
+    # ~/.openjarvis/orb/voices/reference.wav if present, else "grave";
+    # or grave | pose | clair | tom | pierre | /path/to/clip.wav
+    chatterbox_reference: str = ""
+    chatterbox_exaggeration: float = 0.4
+    chatterbox_cfg_weight: float = 0.5  # lower = faster but may invent words
+    chatterbox_speed: float = 1.15  # pitch kept
+    chatterbox_effect: str = "none"
+    chatterbox_language: str = "fr"
+    chatterbox_temperature: float = 0.8
+    chatterbox_quantize: int = 8  # 0, 4, 6 or 8
+    chatterbox_flow_steps: int = 4
+    chatterbox_model: str = ""  # "" = mlx-community/chatterbox-multilingual-v3
     piper_voice: str = "fr_FR-tom-medium"
     say_voice: str = "Thomas"
     speed: float = 1.15
@@ -141,9 +154,9 @@ barge_in = true           # dire le mot d'activation pendant qu'il parle l'inter
 barge_in_threshold = 0.75 # plus strict car le micro entend aussi sa voix
 
 [voice]
-# voix locales : "piper", "say" (macOS)
+# voix locales : "chatterbox" (naturelle), "piper", "say" (macOS)
 # voix en ligne (le texte part sur un serveur) : "edge" (Microsoft), "elevenlabs"
-engine = "piper"
+engine = "chatterbox"
 local_only = true         # true = jamais de voix en ligne, même si choisie
 # voix à écouter : ~/Jarvis/voix-reelles/index.txt
 edge_voice = "fr-FR-RemyMultilingualNeural"
@@ -152,6 +165,20 @@ pitch = "+0Hz"            # edge : hauteur, ex. "-2Hz"
 elevenlabs_voice = ""
 elevenlabs_model = "eleven_flash_v2_5"
 online_effect = "none"    # effet pour edge/elevenlabs (none = voix naturelle)
+# Chatterbox, 100 % local. Échantillons : ~/Jarvis/voix-locales/index.txt
+# Installation : .venv/bin/python -m openjarvis.orb.voice_setup
+# voix : "" = ta voix dans ~/.openjarvis/orb/voices/reference.wav sinon "grave" ;
+# ou grave, pose, clair, tom, pierre, ou le chemin d'un .wav de 10 s
+chatterbox_reference = ""
+chatterbox_exaggeration = 0.4   # expressivité
+chatterbox_cfg_weight = 0.5     # plus bas = plus rapide mais peut inventer des mots
+chatterbox_speed = 1.15         # débit (la hauteur de voix est conservée)
+chatterbox_effect = "none"
+chatterbox_language = "fr"
+chatterbox_temperature = 0.8
+chatterbox_quantize = 8         # 0, 4, 6 ou 8
+chatterbox_flow_steps = 4       # 5 = un peu plus fin, un peu plus lent
+chatterbox_model = ""
 piper_voice = "fr_FR-tom-medium"
 say_voice = "Thomas"
 speed = 1.15              # débit de parole (1.0 = normal)
